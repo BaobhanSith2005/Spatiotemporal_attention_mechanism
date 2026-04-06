@@ -32,7 +32,7 @@ class ModelRanking:
     一个用于追踪和管理N个最佳模型的辅助类。
     它使用最小堆来高效地找到当前性能最差的模型。
     """
-    def __init__(self, top_n=5):
+    def __init__(self, top_n=10):
         self.top_n = top_n
         self.rankings = []
         self.saved_paths = []
@@ -98,23 +98,23 @@ def PPO_episoid_1(model_path=None, max_steps_per_episode=500):
 
     # 优化学习参数：平衡学习率和稳定性
     ppo_shoulder = PPO(policy=policy_shoulder_net, act_dim=1, lr=1e-5, clip_ratio=0.2,  # 稍微提高学习率到1e-5
-                         update_epochs=4, minibatch_size=32, gamma=0.99, lam=0.95, entropy_coef=0.1, device=device)  # 增加entropy_coef到0.1，约束sigma减小
+                         update_epochs=4, minibatch_size=32, gamma=0.99, lam=0.95, entropy_coef=0.02, device=device)  # 更保守的初始熵系数，避免持续推高sigma
     ppo_arm = PPO(policy=policy_arm_net, act_dim=1, lr=1e-5, clip_ratio=0.2,
-                   update_epochs=4, minibatch_size=32, gamma=0.99, lam=0.95, entropy_coef=0.1, device=device)
+                   update_epochs=4, minibatch_size=32, gamma=0.99, lam=0.95, entropy_coef=0.02, device=device)
 
     ppo2_LegUpper = PPO2(node_num=20, env_information=None)  # 创建PPO2对象
     ppo2_LegLower = PPO2(node_num=20, env_information=None)  # 创建PPO2对象
     ppo2_Ankle = PPO2(node_num=20, env_information=None)  # 创建PPO2对象
 
     # --- 初始化排行榜 ---
-    top_n_models = 5
+    top_n_models = 10
     model_ranking = ModelRanking(top_n=top_n_models)
     
     # 初始化日志写入器
     log_writer_catch = Log_write()  # 创建抓取日志写入器
     log_writer_tai = Log_write()  # 创建抬腿日志写入器
     CHECKPOINT_INTERVAL = 200  # 从500减少到100，更频繁的评估
-    NUM_TEST_EPISODES = 50     # 从100减少到20，加快测试速度  
+    NUM_TEST_EPISODES = 400     # 从100减少到20，加快测试速度  
     MAX_TEST_ATTEMPTS = 5 
     tai_episoid = 1
     import os
@@ -302,11 +302,19 @@ def PPO_episoid_1(model_path=None, max_steps_per_episode=500):
     episode_count_for_train = 0        # 总episode计数，用于定期学习
 
     max_total_episodes = episode_start + 10000
+    entropy_coef_start = 0.02
+    entropy_coef_end = 0.002
+    entropy_decay_episodes = 5000
 
     while episode_num < max_total_episodes:  # 从episode_start开始，最多再训练多少个周期
         i = episode_num
+        entropy_progress = min(max(i - episode_start, 0) / float(entropy_decay_episodes), 1.0)
+        current_entropy_coef = entropy_coef_start + (entropy_coef_end - entropy_coef_start) * entropy_progress
+        ppo_shoulder.entropy_coef = current_entropy_coef
+        ppo_arm.entropy_coef = current_entropy_coef
         log_writer_catch.clear()
         log_writer_catch.add(episode_num=i)
+        log_writer_catch.add(entropy_coef=current_entropy_coef)
         print(f"<<<<<<<<<第{i}周期") # 打印当前周期
         success_flag1 = 0
         # 在 episode 开始之前：冻结 policy_old（用于数据收集时logp）并清空 actor 内部时间 buffer
@@ -348,12 +356,14 @@ def PPO_episoid_1(model_path=None, max_steps_per_episode=500):
             # 1) Select actions (training mode)
             action_shoulder, log_prob_shoulder, value_shoulder = ppo_shoulder.choose_action(obs_img, ppo_state, deterministic=False)
             action_arm, log_prob_arm, value_arm = ppo_arm.choose_action(obs_img, ppo_state, deterministic=False)
+            current_obs_img = deepcopy(obs_img)
+            current_ppo_state = deepcopy(ppo_state.clone().detach().cpu().numpy()) if isinstance(ppo_state, torch.Tensor) else deepcopy(ppo_state)
 
             # 将 action 转为 scalar 并进行合理裁剪（与测试保持一致）
-            action_shoulder_clipped = np.clip(action_shoulder, -0.5, 0.5)
-            action_arm_clipped = np.clip(action_arm, -0.5, 0.5)
-            action_shoulder_scalar = float(action_shoulder_clipped.flatten()[0])
-            action_arm_scalar = float(action_arm_clipped.flatten()[0])
+            action_shoulder = np.clip(action_shoulder, -0.5, 0.5)
+            action_arm = np.clip(action_arm, -0.5, 0.5)
+            action_shoulder_scalar = float(action_shoulder.flatten()[0])
+            action_arm_scalar = float(action_arm.flatten()[0])
 
             print(f'第{i}周期，第{steps}步，肩膀动作: {action_shoulder_scalar:.4f}，手臂动作: {action_arm_scalar:.4f}')           
             # collect sensor info & flags
@@ -369,31 +379,31 @@ def PPO_episoid_1(model_path=None, max_steps_per_episode=500):
 
             # 执行动作
             next_state, reward, done, good, goal, count = env.step(robot_state, action_shoulder_scalar, action_arm_scalar, steps, catch_flag, gps1, gps2, gps3, gps4, img_name)
+            post_gps1, post_gps2, post_gps3, post_gps4, post_foot_gps1 = env.print_gps()
 
-            # ---------- reward design (改进版：稳定距离奖励，避免震荡) ----------
-            if len(gps1) < 3:
+            # ---------- reward design: compute reward from the post-action state ----------
+            if len(post_gps1) < 3:
                 dy, dz = 0.0, 0.0
             else:
-                dy = gps_goal1[0] - gps1[1]
-                dz = gps_goal1[1] - gps1[2]
+                dy = gps_goal1[0] - post_gps1[1]
+                dz = gps_goal1[1] - post_gps1[2]
             current_distance = (dy ** 2 + dz ** 2) ** 0.5
 
             if prev_distance is not None:
-                # 使用平滑的距离奖励：基于距离的倒数，避免震荡
+                # 奖励只依赖当前动作导致的距离变化，避免 credit assignment 错位
                 distance_improvement = prev_distance - current_distance
-                if distance_improvement > 0:  # 只有在接近目标时才给正奖励
-                    reward = distance_improvement * 3.0  # 降低系数避免过大梯度
+                if distance_improvement > 0:
+                    reward = distance_improvement * 4.0
                 else:
-                    reward = distance_improvement * 1.0  # 远离目标时轻微惩罚
+                    reward = distance_improvement * 1.5
 
-                # 额外奖励：距离越近奖励越大
-                proximity_reward = max(0, (1.0 - current_distance / 2.0)) * 0.5  # 距离越近奖励越大
+                proximity_reward = max(0, (1.0 - current_distance / 2.0)) * 0.5
                 reward += proximity_reward
             else:
-                reward = -current_distance * 0.3  # 减少初始距离惩罚
+                reward = -current_distance * 0.3
             prev_distance = current_distance
 
-            # 抓取检测（放宽条件：单手成功即可）
+            # 抓取奖励只奖励“正确抓到目标”，避免碰错阶梯也得到大额奖励
             all_grasp_sensors = [
                 env.darwin.get_touch_sensor_value('grasp_L1'),
                 env.darwin.get_touch_sensor_value('grasp_L1_1'),
@@ -402,6 +412,7 @@ def PPO_episoid_1(model_path=None, max_steps_per_episode=500):
                 env.darwin.get_touch_sensor_value('grasp_R1_1'),
                 env.darwin.get_touch_sensor_value('grasp_R1_2')
             ]
+
             left_any = any(all_grasp_sensors[0:3])
             right_any = any(all_grasp_sensors[3:6])
             # 放宽成功条件：只要任意一侧有接触就算成功
@@ -452,8 +463,8 @@ def PPO_episoid_1(model_path=None, max_steps_per_episode=500):
             
             if should_store:
                 tr = {
-                    'obs_img': deepcopy(obs_img),
-                    'obs_state': deepcopy(ppo_state.clone().detach().cpu().numpy()) if isinstance(ppo_state, torch.Tensor) else deepcopy(ppo_state),
+                    'obs_img': current_obs_img,
+                    'obs_state': current_ppo_state,
                     'action_shoulder': deepcopy(action_shoulder),
                     'action_arm': deepcopy(action_arm),
                     'reward': float(reward),
@@ -592,6 +603,11 @@ def PPO_episoid_1(model_path=None, max_steps_per_episode=500):
                     ppo_shoulder.policy.eval()
                     ppo_arm.policy.eval()
 
+                    # 每次 checkpoint 用独立的数组名称记录 test_goal 数据
+                    checkpoint_test_goal_key = f"test_goal_{i}"
+                    # 重置该 key 数组；如果之前存在，先清空，确保当前 checkpoint 仅包含本轮数据
+                    log_writer_catch.data[checkpoint_test_goal_key] = []
+
                     successful_test_episodes = 0
                     valid_test_cnt   = 0          # 已经跑完的有效轮次
                     total_test_cnt   = 0          # 总共开的轮次（含无效）
@@ -689,6 +705,9 @@ def PPO_episoid_1(model_path=None, max_steps_per_episode=500):
                             print(f"  ✓ 测试成功！(传感器:L{test_left_any},R{test_right_any}, 距离:{test_current_distance:.3f})")
                         else:
                             print(f"  ✗ 测试失败。(传感器:L{test_left_any},R{test_right_any}, 距离:{test_current_distance:.3f})")
+
+                        # 记录测试阶段单次是否成功（goal 标记），每次 checkpoint 用单独数组
+                        log_writer_catch.data[checkpoint_test_goal_key].append(int(test_success_flag))
 
                         valid_test_cnt += 1          # 只有跑到这里才算完成一次有效测试
                     ppo_shoulder.policy.train()

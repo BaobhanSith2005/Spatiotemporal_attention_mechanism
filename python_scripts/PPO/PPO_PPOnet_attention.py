@@ -605,11 +605,11 @@ class PPO:
             layer = getattr(self.policy, 'log_std_layer', None)
             if layer is None:
                 return 1.0
-            # 如果 bias 可用，用 bias 的均值；否则尝试用 weight 的均值；最后 fallback 为 1.0
+            # 计算 softplus(s) 真实 sigma 约计
             if hasattr(layer, 'bias') and layer.bias is not None:
-                return float(torch.exp(layer.bias.data.mean()).cpu().item())
+                return float(F.softplus(layer.bias.data).mean().cpu().item())
             if hasattr(layer, 'weight'):
-                return float(torch.exp(layer.weight.data.mean()).cpu().item())
+                return float(F.softplus(layer.weight.data).mean().cpu().item())
             return 1.0
 
 
@@ -748,8 +748,9 @@ class PPO:
                 dist = torch.distributions.Normal(mu, sigma)
                 raw = dist.rsample()
 
-            action = torch.tanh(raw)
-            logp = self.log_prob_tanh_action(mu, sigma, action)
+            action_raw = torch.tanh(raw)  # in [-1, 1]
+            action = 0.5 * action_raw      # scale to [-0.5, 0.5] for env constraints
+            logp = self.log_prob_tanh_action(mu, sigma, action_raw)
 
             action_np = action.cpu().numpy().squeeze()
             logp_f = float(logp.cpu().numpy().squeeze())
@@ -787,9 +788,15 @@ class PPO:
             a_t = torch.from_numpy(action).float()
         elif isinstance(action, torch.Tensor):
             a_t = action.detach().cpu().float()
+        elif isinstance(action, (float, int, np.floating, np.integer)):
+            a_t = torch.tensor([float(action)], dtype=torch.float32)
         else:
             raise TypeError(f"action type invalid: {type(action)}")
-            
+
+        # normalize action shape to (act_dim,) or scalar (1)
+        if a_t.ndim == 0:
+            a_t = a_t.unsqueeze(0)
+
         # ---------- store ----------
         self.buf_obs_img.append(img_t.clone())
         self.buf_obs_state.append(st_t.clone())
@@ -886,6 +893,7 @@ class PPO:
         # update policy_old to current policy params BEFORE updating? No: PPO uses old policy stored at data collection time.
         # policy_old was saved when collecting data (we must ensure that before collecting we called policy_old.load_state_dict(policy.state_dict()))
         # We'll perform K epochs of SGD on the collected dataset
+        total_loss = 0.0
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
@@ -894,6 +902,13 @@ class PPO:
         for epoch in range(self.update_epochs):
             for batch in dataloader:
                 b_imgs, b_states, b_actions, b_old_logp, b_returns, b_adv = [x.to(self.device) for x in batch]
+
+                # 保证 logp 和 advantage 在计算比值时拥有匹配的形状 [B, 1]，
+                # 否则广播会把每个样本同批次其它样本混在一起，导致 policy_loss 恒为 0。
+                if b_old_logp.dim() == 1:
+                    b_old_logp = b_old_logp.unsqueeze(-1)
+                if b_adv.dim() == 1:
+                    b_adv = b_adv.unsqueeze(-1)
 
                 # new policy evaluation
                 mu, sigma, value_pred = self.policy(b_imgs, b_states)  # shapes: [B,act_dim], [B,act_dim], [B,1]
@@ -924,7 +939,8 @@ class PPO:
                     sigma = torch.nan_to_num(sigma, nan=1e-3, posinf=1e6, neginf=1e-6)
                     sigma = torch.clamp(sigma, 1e-6, 1e3)
 
-                new_logp = self.log_prob_tanh_action(mu, sigma, b_actions)
+                # 由于 choose_action 里用了 0.5 缩放，计算 logp 时需要还原到 tanh(raw) 的尺度
+                new_logp = self.log_prob_tanh_action(mu, sigma, b_actions * 2.0)
                 # ratio
                 ratio = torch.exp(new_logp - b_old_logp)
                 # clipped surrogate
@@ -974,6 +990,7 @@ class PPO:
                     return dict(loss=0.0, policy_loss=0.0, value_loss=0.0, entropy=0.0,
                                 log_std_mean=0.0, log_std_grad_norm=0.0, mean_sigma=0.0, skipped=True)
 
+                total_loss += loss.item()
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy += ent.item()
@@ -1009,7 +1026,7 @@ class PPO:
             except Exception:
                 pass
 
-        return dict(loss=total_policy_loss / max(1, iters),
+        return dict(loss=total_loss / max(1, iters),
                     policy_loss=total_policy_loss / max(1, iters),
                     value_loss=total_value_loss / max(1, iters),
                     entropy=total_entropy / max(1, iters),
