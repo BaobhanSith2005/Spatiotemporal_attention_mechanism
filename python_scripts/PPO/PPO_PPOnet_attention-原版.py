@@ -1,10 +1,12 @@
 from collections import deque
 import gc  # 移到文件顶部，避免重复导入
 import random  # 用于ReplayBuffer的sample方法
-
+import math
+import numpy as np
+from copy import deepcopy
+from torch.utils.data import DataLoader, TensorDataset
 import torch
 import torch.nn as nn
-import numpy as np
 import torch_geometric
 from torch_geometric.data import Data
 import torch.nn.functional as F
@@ -12,7 +14,8 @@ from python_scripts.Project_config import device
 from Spatiotemporal_attention_mechanism.spatial_attention.CBAM import CBAM
 from Spatiotemporal_attention_mechanism.spatial_attention.bidirectional_cross_attention import BidirectionalCrossAttention
 from Spatiotemporal_attention_mechanism.temporal_attention.multihead_self_attention import MultiHeadSelfAttention
-
+import csv
+import os
 class ReplayBuffer:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -80,289 +83,417 @@ class DecisionLayer(nn.Module):
 class ActorCritic(nn.Module):
     def __init__(self, act_dim):
         super().__init__()
-        self.device = device  # 设置设备属性
-        self.buffer_img = deque(maxlen=20)
-        self.buffer_state = deque(maxlen=20)
+        # 依赖文件中定义的全局 device（若不存在请在文件顶部定义）
+        self.device = device
 
-        self.relu = nn.ReLU()
-        # 图像处理部分 - 优化配置减少内存占用
+        # buffers for temporal attention (store raw features)
+        from collections import deque
+        self.buffer_img = deque(maxlen=20)    # each element: Tensor [1,1,128]
+        self.buffer_state = deque(maxlen=20)  # each element: Tensor [1,1,128]
+
+        # --------------------------
+        # visual conv backbone (single-channel input)
+        # --------------------------
         self.conv1 = nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)  # 128→64
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)  # 128 -> 64
         self.bn2 = nn.BatchNorm2d(32)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)  # 64→32 - 大幅减少通道数
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)  # 64 -> 32
         self.bn3 = nn.BatchNorm2d(64)
         self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
         self.bn4 = nn.BatchNorm2d(64)
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(64 * 32 * 32, 512)  # 更新维度并减少神经元数量
-        self.dropout = nn.Dropout(0.2)  # 减少dropout率以保留更多信息
-        self.fc2 = nn.Linear(512, 256)  # 降维到256
-        self.fc3 = nn.Linear(256, 128)  # 进一步降维
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
 
-        # 舵机角度处理部分
-        self.conv_graph1 = torch_geometric.nn.SAGEConv(1, 1024 // 4, normalize=True)
-        self.bn_graph1 = torch_geometric.nn.BatchNorm(1024 // 4)
-        self.conv_graph2 = torch_geometric.nn.GATConv(1024 // 4, 1024 // 2, heads=4)
-        self.bn_graph2 = torch_geometric.nn.BatchNorm(4 * 1024 // 2)  # 多头输出维度变化
-        self.conv_graph3 = torch_geometric.nn.SAGEConv(4 * 1024 // 2, 1024)
-        self.bn_graph3 = torch_geometric.nn.BatchNorm(1024)
-        self.conv_graph4 = torch_geometric.nn.GATConv(1024, 1024, heads=1)  # 单头输出
-        self.bn_graph4 = torch_geometric.nn.BatchNorm(1024)
-        self.conv_graph5 = torch_geometric.nn.GCNConv(1024, 512)
+        self.flatten = nn.Flatten()
+        # processed pipeline FC (for spatial branch)
+        self.fc1 = nn.Linear(64 * 32 * 32, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 128)
+
+        # raw pipeline FC (for temporal branch using raw conv features)
+        self.fc_raw1 = nn.Linear(64 * 32 * 32, 512)
+        self.fc_raw2 = nn.Linear(512, 256)
+        self.fc_raw3 = nn.Linear(256, 128)
+
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.2)
+
+        # --------------------------
+        # state raw projection (原始 4-D -> temporal 128-D)
+        # --------------------------
+        self.fc_state_raw1 = nn.Linear(4, 64)
+        self.fc_state_raw2 = nn.Linear(64, 128)
+
+        # --------------------------
+        # Graph-based state processing (spatial state branch) - 保持原有设计
+        # --------------------------
+        # NOTE: these layers assume torch_geometric is available and creat_graph() exists elsewhere in file
+        import torch_geometric.nn as tgnn
+        self.conv_graph1 = tgnn.SAGEConv(1, 1024 // 4, normalize=True)
+        self.bn_graph1 = tgnn.BatchNorm(1024 // 4)
+        self.conv_graph2 = tgnn.GATConv(1024 // 4, 1024 // 2, heads=4)
+        self.bn_graph2 = tgnn.BatchNorm(4 * 1024 // 2)
+        self.conv_graph3 = tgnn.SAGEConv(4 * 1024 // 2, 1024)
+        self.bn_graph3 = tgnn.BatchNorm(1024)
+        self.conv_graph4 = tgnn.GATConv(1024, 1024, heads=1)
+        self.bn_graph4 = tgnn.BatchNorm(1024)
+        self.conv_graph5 = tgnn.GCNConv(1024, 512)
         self.fc4 = nn.Linear(512, 128)
 
-        # 空间注意力部分，针对图像
+        # --------------------------
+        # CBAM spatial attention (kept unchanged)
+        # --------------------------
         self.cbam1 = CBAM(16)
         self.cbam2 = CBAM(32)
         self.cbam3 = CBAM(64)
         self.cbam4 = CBAM(64)
 
-        # 时间注意力部分
+        # --------------------------
+        # Temporal attention modules (same dims as feature proj)
+        # --------------------------
+        # MultiHeadSelfAttention implementations assumed present in file
         self.tem_attn1 = MultiHeadSelfAttention(128, 4, 0.1)
         self.tem_attn2 = MultiHeadSelfAttention(128, 4, 0.1)
 
-        # 交叉注意力融合部分
-        self.spatial_vision_graph_attn = BidirectionalCrossAttention(  # 图像-舵机角度空间交互
-            dim=128, heads=4, dim_head=32, prenorm=True
-        )
-        self.spatial_fusion_attn = BidirectionalCrossAttention(  # 空间融合
-            dim=256, heads=8, dim_head=32, prenorm=True
-        )
-        self.temporal_vision_graph_attn = BidirectionalCrossAttention(  # 图像-舵机角度时间交互
-            dim=128, heads=4, dim_head=32, prenorm=True
-        )
-        self.temporal_fusion_attn = BidirectionalCrossAttention(  # 时间融合
-            dim=256, heads=8, dim_head=32, prenorm=True
-        )
-        self.final_fusion_attn_front = BidirectionalCrossAttention(  # 时空融合
-            dim=256, heads=8, dim_head=32, prenorm=True
-        )
-        self.final_fusion_attn = BidirectionalCrossAttention(  # 时空融合
-            dim=512, heads=16, dim_head=32, prenorm=True
-        )
+        # Cross attention fusion layers (kept)
+        self.spatial_vision_graph_attn = BidirectionalCrossAttention(dim=128, heads=4, dim_head=32, prenorm=True)
+        self.spatial_fusion_attn = BidirectionalCrossAttention(dim=256, heads=8, dim_head=32, prenorm=True)
+        self.temporal_vision_graph_attn = BidirectionalCrossAttention(dim=128, heads=4, dim_head=32, prenorm=True)
+        self.temporal_fusion_attn = BidirectionalCrossAttention(dim=256, heads=8, dim_head=32, prenorm=True)
+        self.final_fusion_attn_front = BidirectionalCrossAttention(dim=256, heads=8, dim_head=32, prenorm=True)
+        self.final_fusion_attn = BidirectionalCrossAttention(dim=512, heads=16, dim_head=32, prenorm=True)
 
-        # 决策层
-        self.decision_layer = DecisionLayer(input_dim=512, hidden_dim=256, output_dim=1)
+        # Decision / actor-critic heads
+        self.decision_layer = DecisionLayer(input_dim=512, hidden_dim=256, output_dim=1)  # keep if used
         self.critic = nn.Linear(512, 1)
         self.mu_layer = nn.Linear(512, act_dim)
         self.log_std_layer = nn.Linear(512, act_dim)
-        # 添加参数限制范围，避免NaN值
-        self.log_std_min = -20  # 最小对数标准差，exp(-20)≈2e-9
-        self.log_std_max = 2    # 最大对数标准差，exp(2)≈7.39
+        self.log_std_min = -20
+        self.log_std_max = 2
 
+        # 初始化 log_std_layer 为中等探索性（避免塌缩到0）
+        nn.init.constant_(self.log_std_layer.weight, 0.0)
+        nn.init.constant_(self.log_std_layer.bias, -1.0)  # 对应 sigma ≈ 0.37
 
-    # 将图像特征存入缓冲区
-    def update_buffer_img(self, feature):
-        self.buffer_img.append(feature.detach())
+    # --------------------------
+    # Buffer utils
+    # --------------------------
+    def update_buffer_img(self, feature: torch.Tensor):
+        """
+        feature: [1,1,128] or [B,1,128] -> we store per-sample [1,1,128]
+        """
+        if isinstance(feature, torch.Tensor):
+            # keep CPU detached copy
+            f = feature.detach().cpu()
+            # if batch, iterate and store each sample separately
+            if f.dim() == 3 and f.shape[0] > 1:
+                for i in range(f.shape[0]):
+                    self.buffer_img.append(f[i:i+1].clone())
+            else:
+                self.buffer_img.append(f.clone())
+        else:
+            raise TypeError("update_buffer_img expects torch.Tensor")
 
-    # 将舵机角度特征存入缓冲区
-    def update_buffer_state(self, feature):
-        self.buffer_state.append(feature.detach())
+    def update_buffer_state(self, feature: torch.Tensor):
+        """
+        feature: [1,1,128] or [B,1,128] -> store per-sample
+        """
+        if isinstance(feature, torch.Tensor):
+            f = feature.detach().cpu()
+            if f.dim() == 3 and f.shape[0] > 1:
+                for i in range(f.shape[0]):
+                    self.buffer_state.append(f[i:i+1].clone())
+            else:
+                self.buffer_state.append(f.clone())
+        else:
+            raise TypeError("update_buffer_state expects torch.Tensor")
 
-    # 时间注意力前处理
-    def _process_temporal(self, buffer, new_feature):
-        sequence = torch.stack([b.to(new_feature.device) for b in buffer], dim=1)  # [B, T, D]
-        return sequence
+    def reset_buffer(self):
+        self.buffer_img.clear()
+        self.buffer_state.clear()
 
+    # --------------------------
+    # Internal helper: make sure img and state shapes are normalized
+    # --------------------------
+    def _normalize_inputs(self, img, state):
+        """
+        Ensure img -> Tensor with shape (N,1,H,W)
+               state -> Tensor with shape (N, state_dim)
+        Accepts numpy / torch / list
+        """
+        # img
+        if not isinstance(img, torch.Tensor):
+            img = torch.from_numpy(np.asarray(img)).float()
+        # Accept dims: (H,W), (C,H,W), (N,H,W), (N,C,H,W)
+        if img.dim() == 2:
+            img = img.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        elif img.dim() == 3:
+            # ambiguous: treat as (N,H,W) if first dim != small channel count
+            c0 = img.size(0)
+            if c0 == 1:
+                img = img.unsqueeze(0)  # (1,1,H,W)
+            elif c0 == 3:
+                # if RGB, convert to grayscale
+                img = img.mean(dim=0, keepdim=True).unsqueeze(0)
+            else:
+                # assume (N,H,W)
+                img = img.unsqueeze(1)  # (N,1,H,W)
+        elif img.dim() == 4:
+            N, C, H, W = img.shape
+            if C != 1:
+                img = img.mean(dim=1, keepdim=True)  # (N,1,H,W)
+        else:
+            raise ValueError(f"Unsupported img dims: {img.shape}")
+
+        # state
+        if isinstance(state, list) or isinstance(state, np.ndarray):
+            st_t = torch.from_numpy(np.asarray(state)).float()
+        elif isinstance(state, torch.Tensor):
+            st_t = state.float()
+        else:
+            st_t = torch.tensor(state, dtype=torch.float32)
+        if st_t.dim() == 1:
+            st_t = st_t.unsqueeze(0)  # (1, state_dim)
+
+        # move to device
+        img = img.to(self.device)
+        st_t = st_t.to(self.device)
+        return img, st_t
+
+    # --------------------------
+    # helper to prepare temporal sequence tensors
+    # --------------------------
+    def _stack_buffer(self, buffer_deque):
+        """
+        Return stacked sequence of buffered features on device.
+        buffer_deque elements are CPU tensors [1, C, D] -> returns Tensor [T, C, D] on device
+        """
+        if len(buffer_deque) == 0:
+            return None
+        seq = torch.cat(list(buffer_deque), dim=0)  # [T, C, D] on CPU
+        return seq.to(self.device)
+
+    # --------------------------
+    # forward: returns (mu, sigma, value)
+    # --------------------------
     def forward(self, img, state):
         """
-        参数:
-        - img: 输入图像，形状为 [1, 128, 128]
-        - state: 输入状态，形状为 [4]
+        img: numpy / torch ; shapes accepted: (H,W), (C,H,W), (N,H,W), (N,C,H,W)
+        state: list / numpy / torch ; shapes: (4,) or (N,4)
+        return: mu [B,act_dim], sigma [B,act_dim], value [B,1]
         """
-        # 提取图像初始特征
-        y = self.conv1(img)
-        y = self.cbam1(y)
-        y = self.bn1(y)
-        y = self.relu(y)
-        y = self.dropout(y)
-        y = self.conv2(y)
-        y = self.cbam2(y)
-        y = self.bn2(y)
-        y = self.relu(y)
-        y = self.dropout(y)
-        y = self.conv3(y)
-        y = self.cbam3(y)
-        y = self.bn3(y)
-        y = self.relu(y)
-        y = self.dropout(y)
-        y = self.conv4(y)
-        y = self.cbam4(y)
-        y = self.bn4(y)
-        y = self.relu(y)
-        y = self.dropout(y)
-        y = self.flatten(y)
-        y = self.fc1(y)
-        y = self.fc2(y)
-        y = self.fc3(y)
-        
-        # 归一化处理，支持批量和单个输入
-        # 对于批量输入，对每个样本单独归一化
-        if len(y.shape) > 1:
-            batch_size = y.shape[0]
-            normalized_features = []
-            
-            for i in range(batch_size):
-                min_val = torch.min(y[i])
-                max_val = torch.max(y[i])
-                denominator = torch.sub(max_val, min_val) + 1e-8
-                norm_y = torch.div(torch.sub(y[i], min_val), denominator)
-                normalized_features.append(norm_y.unsqueeze(0))
-            
-            # 合并批量特征并添加通道维度
-            initial_image_features = torch.cat(normalized_features, dim=0).unsqueeze(1)  # [batch_size, 1, 128]
-        else:
-            # 单个输入的处理
-            min_val1 = torch.min(y)  # 最小值
-            max_val1 = torch.max(y)  # 最大值
-            denominator = torch.sub(max_val1, min_val1) + 1e-8  # 1e-8 是一个很小的数
-            initial_image_features = torch.div(torch.sub(y, min_val1), denominator).unsqueeze(1)  # [1, 1, 128]
 
+        # normalize inputs to (N,1,H,W) and (N,4)
+        img, st_t = self._normalize_inputs(img, state)
+        batch_size = img.shape[0]
 
-        # 提取舵机初始特征
-        graph_result = self.creat_graph(state)
-        
-        # 处理批量或单个输入
-        if isinstance(graph_result, list):  # 批量输入
-            batch_size = len(graph_result)
-            batch_features = []
-            
-            # 对每个样本单独处理
+        # --------------------------
+        # Processed pipeline (with CBAM) -> used by spatial attention branch
+        # --------------------------
+        p = self.conv1(img)
+        p = self.cbam1(p)
+        p = self.bn1(p); p = self.relu(p); p = self.dropout(p)
+
+        p = self.conv2(p)
+        p = self.cbam2(p)
+        p = self.bn2(p); p = self.relu(p); p = self.dropout(p)
+
+        p = self.conv3(p)
+        p = self.cbam3(p)
+        p = self.bn3(p); p = self.relu(p); p = self.dropout(p)
+
+        p = self.conv4(p)
+        p = self.cbam4(p)
+        p = self.bn4(p); p = self.relu(p); p = self.dropout(p)
+
+        p_flat = self.flatten(p)  # [B, 64*32*32]
+        p_fc = self.relu(self.fc1(p_flat))
+        p_fc = self.relu(self.fc2(p_fc))
+        p_fc = self.relu(self.fc3(p_fc))  # [B,128]
+
+        # normalize per-sample and shape to [B,1,128] for attention modules
+        p_fc_min = p_fc.view(batch_size, -1).min(dim=1, keepdim=True)[0]
+        p_fc_max = p_fc.view(batch_size, -1).max(dim=1, keepdim=True)[0]
+        p_fc = (p_fc - p_fc_min) / (p_fc_max - p_fc_min + 1e-8)
+        initial_image_features = p_fc.unsqueeze(1)  # [B,1,128]
+
+        # --------------------------
+        # Raw pipeline (without CBAM) -> used by temporal branch
+        # --------------------------
+        r = self.conv1(img)
+        r = self.bn1(r); r = self.relu(r); r = self.dropout(r)
+
+        r = self.conv2(r)
+        r = self.bn2(r); r = self.relu(r); r = self.dropout(r)
+
+        r = self.conv3(r)
+        r = self.bn3(r); r = self.relu(r); r = self.dropout(r)
+
+        r = self.conv4(r)
+        r = self.bn4(r); r = self.relu(r); r = self.dropout(r)
+
+        r_flat = self.flatten(r)  # [B, 64*32*32]
+        r_fc = self.relu(self.fc_raw1(r_flat))
+        r_fc = self.relu(self.fc_raw2(r_fc))
+        r_fc = self.relu(self.fc_raw3(r_fc))  # [B,128]
+
+        r_min = r_fc.view(batch_size, -1).min(dim=1, keepdim=True)[0]
+        r_max = r_fc.view(batch_size, -1).max(dim=1, keepdim=True)[0]
+        r_fc = (r_fc - r_min) / (r_max - r_min + 1e-8)
+        initial_image_raw_features = r_fc.unsqueeze(1)  # [B,1,128]
+
+        # --------------------------
+        # State graph processing (spatial branch) - keep original GNN flow
+        # --------------------------
+        graph_result = self.creat_graph(st_t)  # user-provided function expected in file
+        # compute initial_state_features (GNN-processed) as before
+        if isinstance(graph_result, list):
+            batch_graph_feats = []
             for graph in graph_result:
                 x = graph.x
                 edge_index = graph.edge_index
-                
-                # 应用图卷积层
                 x = self.conv_graph1(x, edge_index)
                 x = self.bn_graph1(x)
-                x = self.relu(x)
-                x = self.dropout(x)
+                x = self.relu(x); x = self.dropout(x)
                 x = self.conv_graph2(x, edge_index)
                 x = self.bn_graph2(x)
-                x = self.relu(x)
-                x = self.dropout(x)
+                x = self.relu(x); x = self.dropout(x)
                 x = self.conv_graph3(x, edge_index)
                 x = self.bn_graph3(x)
-                x = self.relu(x)
-                x = self.dropout(x)
+                x = self.relu(x); x = self.dropout(x)
                 x = self.conv_graph4(x, edge_index)
                 x = self.bn_graph4(x)
-                x = self.relu(x)
-                x = self.dropout(x)
+                x = self.relu(x); x = self.dropout(x)
                 x = self.conv_graph5(x, edge_index)
-                x = self.fc4(x)
-                
-                # 归一化处理
-                min_val = torch.min(x)
-                max_val = torch.max(x)
-                denominator = torch.sub(max_val, min_val) + 1e-8
-                x_norm = torch.div(torch.sub(x, min_val), denominator)
-                
-                batch_features.append(x_norm.unsqueeze(0))  # 添加批次维度
-            
-            # 合并所有批次的特征
-            initial_state_features = torch.cat(batch_features, dim=0)  # [batch_size, 4, 128]
-        else:  # 单个输入
+                x = self.fc4(x)  # [nodes,128]
+                # normalize node features
+                mn = x.min(); mx = x.max()
+                x_norm = (x - mn) / (mx - mn + 1e-8)
+                batch_graph_feats.append(x_norm.unsqueeze(0))
+            initial_state_features = torch.cat(batch_graph_feats, dim=0)  # [B, nodes, 128]
+        else:
             graph = graph_result
             x_graph = graph.x
             edge_index = graph.edge_index
-            
             x_graph = self.conv_graph1(x_graph, edge_index)
-            x_graph = self.bn_graph1(x_graph)
-            x_graph = self.relu(x_graph)
-            x_graph = self.dropout(x_graph)
+            x_graph = self.bn_graph1(x_graph); x_graph = self.relu(x_graph); x_graph = self.dropout(x_graph)
             x_graph = self.conv_graph2(x_graph, edge_index)
-            x_graph = self.bn_graph2(x_graph)
-            x_graph = self.relu(x_graph)
-            x_graph = self.dropout(x_graph)
+            x_graph = self.bn_graph2(x_graph); x_graph = self.relu(x_graph); x_graph = self.dropout(x_graph)
             x_graph = self.conv_graph3(x_graph, edge_index)
-            x_graph = self.bn_graph3(x_graph)
-            x_graph = self.relu(x_graph)
-            x_graph = self.dropout(x_graph)
+            x_graph = self.bn_graph3(x_graph); x_graph = self.relu(x_graph); x_graph = self.dropout(x_graph)
             x_graph = self.conv_graph4(x_graph, edge_index)
-            x_graph = self.bn_graph4(x_graph)
-            x_graph = self.relu(x_graph)
-            x_graph = self.dropout(x_graph)
+            x_graph = self.bn_graph4(x_graph); x_graph = self.relu(x_graph); x_graph = self.dropout(x_graph)
             x_graph = self.conv_graph5(x_graph, edge_index)
             x_graph = self.fc4(x_graph)
-            min_val2 = torch.min(x_graph)  # 最小值
-            max_val2 = torch.max(x_graph)  # 最大值
-            denominator2 = torch.sub(max_val2, min_val2) + 1e-8  # 1e-8 是一个很小的数
-            initial_state_features = torch.div(torch.sub(x_graph, min_val2), denominator2).unsqueeze(0) # [1, 4, 128]
+            mn2 = x_graph.min(); mx2 = x_graph.max()
+            x_norm = (x_graph - mn2) / (mx2 - mn2 + 1e-8)
+            initial_state_features = x_norm.unsqueeze(0)  # [1, nodes, 128]
+
+        # --------------------------
+        # State raw projection for temporal attention (关键改动)
+        # --------------------------
+        # st_t: [B, 4]  -> project to [B, 128] -> shape [B,1,128]
+        state_raw = self.relu(self.fc_state_raw1(st_t))
+        state_raw = self.relu(self.fc_state_raw2(state_raw))
+        state_raw = state_raw.unsqueeze(1)  # [B,1,128]
         
-        # 空间注意力融合 - 支持批量处理
+        # --------------------------
+        # Spatial branch (uses processed image features and GNN features) - unchanged
+        # --------------------------
         vision_graph_out, graph_vision_out = self.spatial_vision_graph_attn(initial_image_features, initial_state_features)
-        
-        # 对于批量输入，需要为每个样本重复相应维度
-        batch_size = initial_image_features.shape[0]
         vision_graph_out = vision_graph_out.repeat(1, graph_vision_out.shape[1], 1)
         spatial_features = torch.cat([vision_graph_out, graph_vision_out], dim=-1)
-        spatial_features_out, _ = self.spatial_fusion_attn(spatial_features, spatial_features) # [batch_size, 4, 256]
+        spatial_features_out, _ = self.spatial_fusion_attn(spatial_features, spatial_features)
 
-        # 时间注意力融合 - 更新缓冲区，避免计算图累积
-        # 对于批量输入，我们只使用第一个样本更新缓冲区（或者根据需要调整）
-        if batch_size > 0:
-            self.update_buffer_img(initial_image_features[0:1])  # 只使用第一个样本
-            self.update_buffer_state(initial_state_features[0:1])  # 只使用第一个样本
-        
-        # 时间特征处理 - 支持批量和单个输入
-        if len(self.buffer_img) > 0:
-            # 对于形状为[1,1,128]的特征，应该沿dim=0连接以形成时间序列
-            sequence_img = torch.cat(list(self.buffer_img), dim=0)  # 连接后形状: [N, 1, 128]，其中N是队列长度
-            # 调整维度顺序以匹配注意力机制的输入要求
-            temporal_attn_out = self.tem_attn1(sequence_img.permute(1, 0, 2)).permute(1, 0, 2)
-            # 取最后一个时间步
-            temporal_img_out = temporal_attn_out[-1:, :, :]  # [1,1,128]
-            
-            # 对于批量输入，复制到所有样本
+        # --------------------------
+        # Temporal branch (USE raw features for BOTH image & state)
+        # --------------------------
+        # update buffers with raw features (store per-sample)
+        # Only append the first sample of the batch to keep behavior consistent with previous design
+        if batch_size >= 1:
+            self.update_buffer_img(initial_image_raw_features[0:1])  # store [1,1,128]
+            self.update_buffer_state(state_raw[0:1])                 # store [1,1,128]
+
+        # stack buffers into [T, C, D] sequences on device
+        seq_imgs = self._stack_buffer(self.buffer_img)    # [T,1,128] or None
+        seq_states = self._stack_buffer(self.buffer_state)  # [T,1,128] or None
+
+        # if sequences exist, apply temporal attention; else fallback to current raw features
+        if seq_imgs is not None and seq_imgs.shape[0] > 0:
+            # tem_attn expects input shape (seq_len, channels, dim) for our impl
+            tmp_img_attn = self.tem_attn1(seq_imgs.permute(0, 1, 2))  # kept interface (assume works)
+            # take last time step representation -> shape [1,1,128] then broadcast to batch
+            temporal_img_out = tmp_img_attn[-1:, :, :].permute(1, 0, 2) if tmp_img_attn.dim() == 3 else tmp_img_attn[-1:, :, :]
+            # ensure shape [1,1,128] then repeat to [B,1,128]
+            temporal_img_out = temporal_img_out.to(self.device)
+            if temporal_img_out.dim() == 2:
+                temporal_img_out = temporal_img_out.unsqueeze(0).unsqueeze(1)
             if batch_size > 1:
-                temporal_img_out = temporal_img_out.repeat(batch_size, 1, 1)  # [batch_size, 1, 128]
+                temporal_img_out = temporal_img_out.repeat(batch_size, 1, 1)
         else:
-            # 安全处理：如果队列为空，使用当前特征
-            temporal_img_out = initial_image_features
+            temporal_img_out = initial_image_raw_features  # [B,1,128]
 
-        if len(self.buffer_state) > 0:
-            # 对于形状为[1,4,128]的特征，应该沿dim=0连接以形成时间序列
-            sequence_state = torch.cat(list(self.buffer_state), dim=0)  # 连接后形状: [N, 4, 128]，其中N是队列长度
-            # 调整维度顺序以匹配注意力机制的输入要求
-            temporal_attn_out = self.tem_attn2(sequence_state.permute(1, 0, 2)).permute(1, 0, 2)
-            # 取最后一个时间步
-            temporal_state_out = temporal_attn_out[-1:, :, :]  # [1,4,128]
-            
-            # 对于批量输入，复制到所有样本
+        if seq_states is not None and seq_states.shape[0] > 0:
+            tmp_state_attn = self.tem_attn2(seq_states.permute(0, 1, 2))
+            temporal_state_out = tmp_state_attn[-1:, :, :].permute(1, 0, 2) if tmp_state_attn.dim() == 3 else tmp_state_attn[-1:, :, :]
+            temporal_state_out = temporal_state_out.to(self.device)
+            if temporal_state_out.dim() == 2:
+                temporal_state_out = temporal_state_out.unsqueeze(0).unsqueeze(1)
             if batch_size > 1:
-                temporal_state_out = temporal_state_out.repeat(batch_size, 1, 1)  # [batch_size, 4, 128]
+                temporal_state_out = temporal_state_out.repeat(batch_size, 1, 1)
         else:
-            # 安全处理：如果队列为空，使用当前特征
-            temporal_state_out = initial_state_features
+            temporal_state_out = state_raw  # [B,1,128]
 
-        # 时间域的视觉-图融合
+        # cross-attention between temporal image & temporal state
         temporal_img_out, temporal_state_out = self.temporal_vision_graph_attn(temporal_img_out, temporal_state_out)
         temporal_img_out = temporal_img_out.repeat(1, temporal_state_out.shape[1], 1)
-        temporal_features = torch.cat([temporal_img_out, temporal_state_out], dim=-1)
-        temporal_features_out, _ = self.temporal_fusion_attn(temporal_features, temporal_features) # [batch_size, 4, 256]
+        temporal_features = torch.cat([temporal_img_out, temporal_state_out], dim=-1)  # [B, nodes?, 256]
+        temporal_features_out, _ = self.temporal_fusion_attn(temporal_features, temporal_features)
+
+        # --------------------------
+        # Final fusion of spatial and temporal features (unchanged)
+        # --------------------------
+        final_img_out, final_state_out = self.final_fusion_attn_front(temporal_features_out, spatial_features_out)
+
+        # -------- FIX: 对齐 token 数 --------
+        # final_img_out:  [B,1,256]
+        # final_state_out: [B,4,256]
+        # expand image tokens -> [B,4,256]
+        final_img_out = final_img_out.repeat(1, final_state_out.shape[1], 1)
+
+        # 现在可以正常 concat
+        final_features = torch.cat([final_img_out, final_state_out], dim=-1)  # [B,4,512]
+
+        final_features_out, _ = self.final_fusion_attn(final_features, final_features)
+
         
-        # 时空注意力融合
-        final_img_out, final_state_out = self.final_fusion_attn_front(temporal_features_out, spatial_features_out) # [batch_size, 4, 256]
-        final_features = torch.cat([final_img_out, final_state_out], dim=-1)
-        final_features_out, _ = self.final_fusion_attn(final_features, final_features) # [batch_size, 4, 512]
-        
-        # 池化处理 - 支持批量
-        pooled_features = final_features_out.mean(dim=1)  # [batch_size, 512]
-        
-        # 输出层 - 支持批量
-        mu = self.mu_layer(pooled_features)  # [batch_size, action_dim]
-        log_std = self.log_std_layer(pooled_features)  # [batch_size, action_dim]
-        # 裁剪log_std值，确保数值稳定性，防止exp操作产生NaN
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        sigma = torch.exp(log_std)
-        value = self.critic(pooled_features)  # [batch_size, 1]
+        # pool and heads
+        pooled = final_features_out.mean(dim=1)  # [B, 512]
+        # actor head: compute mu and stabilized sigma
+        mu = self.mu_layer(pooled)  # [B, act_dim]
+
+        # produce raw log_std then map to positive sigma via softplus (stable)
+        raw_log_std = self.log_std_layer(pooled)  # unconstrained
+        # optional: clamp raw_log_std to avoid huge values before softplus
+        raw_log_std = torch.clamp(raw_log_std, min=self.log_std_min*2, max=self.log_std_max*2)
+        # softplus to ensure positive and smooth
+        sigma = F.softplus(raw_log_std) + 1e-6  # always >0
+
+        # defensive: sanitize mu/sigma for NaN/Inf before returning
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=1e6, neginf=-1e6)
+        sigma = torch.nan_to_num(sigma, nan=1e-3, posinf=1e6, neginf=1e-6)
+
+        value = self.critic(pooled)  # [B,1]
+        value = torch.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
+        # optional debugging CSV write (kept if path exists)
+        try:
+            csv_file_path = 'F:\\project_Spatiotemporal_attention_mechanism\\python_scripts\\PPO\\PPO_PPOnet_attention_new.csv'
+            with open(csv_file_path, mode="a", newline="") as file:
+                writer2 = csv.writer(file)
+                writer2.writerow([mu.detach().cpu().numpy().tolist(), sigma.detach().cpu().numpy().tolist(), value.detach().cpu().numpy().tolist()])
+        except Exception:
+            pass
         
         return mu, sigma, value
-
-
         
 
 
@@ -434,488 +565,517 @@ class ActorCritic(nn.Module):
             return graph
 
 
-
-
-
-
-
 class PPO:
-    def __init__(self,env_information):
-        # 初始化环境信息
-        self.act_dim_shoulder = env_information["action_dim_shoulder"]
-        self.act_dim_arm = env_information["action_dim_arm"]
-        
-        # 创建策略网络和价值网络
-        self.policy = ActorCritic(self.act_dim_shoulder + self.act_dim_arm).to(device)
-        self.policy_old = ActorCritic(self.act_dim_shoulder + self.act_dim_arm).to(device)
+    def __init__(self, policy: torch.nn.Module, act_dim: int,
+                 lr=1e-4, clip_ratio=0.2, update_epochs=10, minibatch_size=64,
+                 gamma=0.99, lam=0.95, entropy_coef=0.2, value_coef=0.5,  # 增加默认entropy_coef到0.2
+                 max_grad_norm=0.5, device=device):
+        """
+        :param policy: ActorCritic 网络（新策略），必须返回 mu, sigma, value
+        :param act_dim: 动作维度（标量动作取 1）
+        """
+        self.device = device
+        self.policy = policy.to(self.device)
+        # policy_old 用于保存收集数据时的旧策略
+        self.policy_old = type(policy)(act_dim).to(self.device)
         self.policy_old.load_state_dict(self.policy.state_dict())
         
-        # 设置优化器和学习率
-        self.lr = 2e-4
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=self.lr)
-        
-        # 学习率调度器
-        self.lr_decay = 0.995  # 学习率衰减
-        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=self.lr_decay)
-        
-        # 初始化经验池，使用deque的maxlen参数自动管理缓冲区大小
-        self.buffer = ReplayBuffer(capacity=50)  # 设置为较小的容量以匹配之前的需求
-        
-        # 设置PPO超参数
-        self.clip_param = 0.2  # 裁剪参数
-        self.max_grad_norm = 1.0  # 梯度裁剪阈值
-        self.lam = 0.95  # GAE参数
-        self.gamma = 0.99  # 折扣因子
-        self.entropy_coef = 0.01  # 熵正则化系数
-        self.value_coef = 0.5  # 价值函数损失系数
-        self.gae_lambda = 0.95  # GAE参数
-        self.clip_ratio = 0.2  # PPO裁剪参数
-        self.update_epochs = 10  # 每批数据的更新次数
-        self.batch_size = 64  # 批大小
+        self.act_dim = act_dim
 
-    def clear_memory(self):
-        """清空所有存储的轨迹数据，释放内存"""
-        self.buffer.clear()
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+        self.clip_ratio = clip_ratio
+        self.update_epochs = update_epochs
+        self.minibatch_size = minibatch_size
+        self.gamma = gamma
+        self.lam = lam
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.max_grad_norm = max_grad_norm
 
-    def choose_action(self, episode_num, obs, explore=None):
-        # 将输入转换为张量并移至正确设备
-        # 添加批次维度以匹配网络期望的4D输入 [batch_size, channels, height, width]
-        # 将输入转换为张量并移至正确设备
-        # 使用clone().detach()以避免PyTorch警告
-        if isinstance(obs[0], torch.Tensor):
-            img = obs[0].clone().detach().to(device, dtype=torch.float32).unsqueeze(0)
-        else:
-            img = torch.tensor(obs[0], dtype=torch.float32, device=device).unsqueeze(0)
-            
-        if isinstance(obs[1], torch.Tensor):
-            state = obs[1].clone().detach().to(device, dtype=torch.float32)
-        else:
-            state = torch.tensor(obs[1], dtype=torch.float32, device=device)
-
-        # 使用递减的epsilon，从0.9开始逐渐降低到0.1
-        epsilon = max(0.1, 0.90 - episode_num * 0.0001)
-
-        # 如果显式指定了explore参数，则使用该值
-        if explore is not None:
-            use_random = explore
-        else:
-            # 否则根据epsilon决定是否探索
-            random_num = np.random.uniform()
-            use_random = random_num < epsilon
-        
-        with torch.no_grad():
-            # 策略网络输出动作分布的均值 mu 和价值 value
-            mu , sigma , value = self.policy(img, state)
-            # 创建一个正态分布，用于计算对数概率和在利用时采样
-            dist_shoulder = torch.distributions.Normal(mu, sigma)
-
-            if use_random:
-                # 探索：在[-1, 1]范围内随机选择动作
-                act_dim = 1
-                action_scaled = torch.tensor(np.random.uniform(-1, 1, size=act_dim), dtype=torch.float32).to(device)
-            else:
-                # 利用：从策略网络生成的分布中采样
-                action_raw = dist_shoulder.sample()
-                action_scaled = torch.tanh(action_raw)
-
-                # 无论动作如何选择，都计算其在当前策略下的对数概率
-                # 这是 on-policy 算法的要求
-            action_raw_for_log_prob = torch.atanh(torch.clamp(action_scaled, -0.9999, 0.9999))
-            log_prob = dist_shoulder.log_prob(action_raw_for_log_prob).sum(axis=-1)
-
-            # 返回选择的动作、其对数概率和状态值
-            return action_scaled.cpu().numpy(), log_prob.item(), value.item()
-
-
-    def store_transition_catch(self, state, action_shoulder, action_arm, reward, next_state, done, value, log_prob_shoulder, log_prob_arm):
-        """
-        存储抓取阶段的经验，使用ReplayBuffer管理内存
-        """
-        # 确保所有数据都不保留计算图
-        if isinstance(action_shoulder, torch.Tensor):
-            action_shoulder = action_shoulder.detach().cpu().numpy()
-        if isinstance(action_arm, torch.Tensor):
-            action_arm = action_arm.detach().cpu().numpy()
-        if isinstance(reward, torch.Tensor):
-            reward = reward.detach().cpu().numpy()
-        if isinstance(done, torch.Tensor):
-            done = done.detach().cpu().numpy()
-        if isinstance(value, torch.Tensor):
-            value = value.detach().cpu().numpy()
-        if isinstance(log_prob_shoulder, torch.Tensor):
-            log_prob_shoulder = log_prob_shoulder.detach().cpu().numpy()
-        if isinstance(log_prob_arm, torch.Tensor):
-            log_prob_arm = log_prob_arm.detach().cpu().numpy()
-        
-        # 创建转换字典
-        transition_dict = {
-            'state': state,
-            'action_shoulder': action_shoulder,
-            'action_arm': action_arm,
-            'reward': reward,
-            'next_state': next_state,
-            'done': done,
-            'value': value,
-            'log_prob_shoulder': log_prob_shoulder,
-            'log_prob_arm': log_prob_arm
-        }
-        
-        # 存储到ReplayBuffer并记录
-        self.buffer.push(transition_dict)
-
-    def calculate_advantages(self):
-        """
-        从ReplayBuffer中提取数据并计算GAE优势函数
-        """
-        if len(self.buffer) == 0:
-            print("警告: ReplayBuffer为空，无法计算优势函数")
-            return np.array([]), np.array([])
-        
-        # 使用ReplayBuffer的sample方法获取所有数据
-        buffer_data = self.buffer.sample(len(self.buffer))
-        rewards = np.array([transition['reward'] for transition in buffer_data])
-        values = np.array([transition['value'] for transition in buffer_data])
-        dones = np.array([transition['done'] for transition in buffer_data])
-        
-        # 检查NaN值
-        if np.any(np.isnan(rewards)):
-            print("NaN found in rewards")
-        if np.any(np.isnan(values)):
-            print("NaN found in values")
-        if np.any(np.isnan(dones)):
-            print("NaN found in dones")
-        
-        # 使用compute_gae方法计算优势函数
-        advantages = self.compute_gae(rewards, values, values[-1] if len(values) > 0 and not dones[-1] else 0, dones)
-        
-        # 计算回报
-        returns = advantages + values
-
-        # 标准化优势函数 - 添加数组长度检查，避免空数组或单元素数组导致的计算错误
-        if len(advantages) > 1:
-            mean_adv = advantages.mean()
-            std_adv = advantages.std()
-            # 检查标准差是否为0
-            if std_adv > 1e-8:
-                advantages = (advantages - mean_adv) / (std_adv + 1e-8)
-            else:
-                advantages = advantages - mean_adv  # 如果标准差为0，只减去均值
-        # 如果只有0或1个元素，则不进行标准化
-
-        return advantages, returns
-    
-    def compute_gae(self, rewards, values, next_value, dones):
-        """
-        计算广义优势估计（GAE）
-        
-        :param rewards: 奖励数组
-        :param values: 价值估计数组
-        :param next_value: 下一个状态的价值估计
-        :param dones: 完成标志数组
-        :return: 优势估计数组
-        """
-        advantages = np.zeros_like(rewards)
-        last_advantage = 0
-        
-        # 从后向前计算优势函数
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                # 对于最后一个时间步，使用next_value
-                delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
-            else:
-                delta = rewards[t] + self.gamma * values[t + 1] * (1 - dones[t]) - values[t]
-            
-            advantages[t] = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * last_advantage
-            last_advantage = advantages[t]
-        
-        return advantages
-    
-    def process_transition_dict(self, transition_dict):
-        """
-        处理转换字典，将不同类型的数据统一转换为张量
-        
-        :param transition_dict: 包含状态、动作、奖励等信息的字典
-        :return: 处理后的字典，所有值都转换为张量
-        """
-        processed_dict = {}
-
-        for key in transition_dict:
-            if isinstance(transition_dict[key], list):
-                # 检查列表中的元素是否为PyTorch张量
-                if transition_dict[key] and isinstance(transition_dict[key][0], torch.Tensor):
-                    # 如果是张量列表，直接使用torch.cat合并它们
-                    tensor = torch.cat(transition_dict[key])
-                else:
-                    # 否则转换为NumPy数组再转换为张量
-                    np_array = np.array(transition_dict[key])
-                    tensor = torch.tensor(np_array, dtype=torch.float)
-
-                # 特殊处理 'states' 和 'next_states'
-                if key == 'states' or key == 'next_states':
-                    # 确保图像数据的形状一致
-                    if len(tensor.shape) != 4:
-                        raise ValueError(f"Unexpected shape for {key}: {tensor.shape}")
-            elif isinstance(transition_dict[key], torch.Tensor):
-                tensor = transition_dict[key].float()
-            else:
-                raise ValueError(f"Unsupported type for key '{key}': {type(transition_dict[key])}")
-
-            processed_dict[key] = tensor
-        return processed_dict
+        # on-policy buffer (trajectory buffer). 每次 update 前会收集若干 step 的数据
+        self.reset_buffer()
 
     def get_current_sigma(self):
         """
-        仅用于日志记录的 sigma 估计，不改变网络结构。
-        这里用 log_std_layer 的 bias 的平均值来近似当前 log_sigma。
+        返回当前策略（policy）估计的动作标准差的标量近似值，供日志使用。
+        由于 policy.log_std_layer 是一个 Linear 层，我们使用其 bias 的平均作为近似。
+        这个方法不会影响训练，仅用于监控。
         """
         with torch.no_grad():
-            # log_std_layer: Linear(512 -> act_dim)，bias 形状是 [act_dim]
-            log_std_bias = self.policy.log_std_layer.bias  # Tensor [act_dim]
-            log_std_mean = log_std_bias.mean()
-            return torch.exp(log_std_mean).item()
-               
-    def learn(self, action_type: str):
-        """
-        根据指定的动作类型（'shoulder' 或 'arm'）更新策略网络。
+            layer = getattr(self.policy, 'log_std_layer', None)
+            if layer is None:
+                return 1.0
+            # 计算 softplus(s) 真实 sigma 约计
+            if hasattr(layer, 'bias') and layer.bias is not None:
+                return float(F.softplus(layer.bias.data).mean().cpu().item())
+            if hasattr(layer, 'weight'):
+                return float(F.softplus(layer.weight.data).mean().cpu().item())
+            return 1.0
 
-        :param action_type: 一个字符串，'shoulder' 或 'arm'，用于指定要更新哪个动作部分。
-        :return: 平均损失值
+
+    def reset_buffer(self):
+        """清空 on-policy buffer（必须在 episode 开始或 update 后调用以避免跨回合污染）"""
+        self.buf_obs_img = []        # list of np arrays or tensors (H,W) or (1,H,W)
+        self.buf_obs_state = []
+        self.buf_actions = []
+        self.buf_logp = []           # old log probs (来自 policy_old) — 存为标量张量
+        self.buf_rewards = []
+        self.buf_vals = []           # value estimates from policy_old at time of collection
+        self.buf_dones = []
+        self.path_start_idx = 0
+        # Also clear computed returns / advantages if present to keep invariants:
+        # After reset, buf_ret / buf_adv must match buf_rewards length (both zero).
+        if hasattr(self, 'buf_adv'):
+            self.buf_adv = []
+        if hasattr(self, 'buf_ret'):
+            self.buf_ret = []
+
+    # ---------- utilities for tanh-squashed gaussian ----------
+    @staticmethod
+    def atanh(x):
+        return 0.5 * (torch.log1p(x) - torch.log1p(-x))
+
+    def gaussian_logprob_raw(self, mu, std, raw_action):
+        """计算 Normal(mu,std) 对 raw_action 的 log_prob（不含 tanh Jacobian）"""
+        var = std.pow(2)
+        log_scale = std.log()
+        return -0.5 * (((raw_action - mu) ** 2) / var + 2 * log_scale + math.log(2 * math.pi))
+
+    def log_prob_tanh_action(self, mu, std, action):
         """
-        # 检查ReplayBuffer是否有足够的数据
-        buffer_size = len(self.buffer)
-        if buffer_size < 4:  # 设置最小样本数
-            print(f"经验不足，当前样本数: {buffer_size}，跳过学习")
-            return 0, 0, 0, 0
-        print(f"开始学习，采样...")
-        # 从经验池中采样一批数据（批次大小为10），非破坏性采样
-        batch_size = min(buffer_size, 10)
-        # 确保sample方法不会修改原始缓冲区
-        sample_transitions = self.buffer.sample(batch_size)
+        Safe tanh-squash log-prob implementation.
+        Includes:
+        - nan/inf sanitization
+        - stable atanh
+        - stable log-Jacobian
+        - clamped std
+        """
+
+        # ---------------------------------------
+        # 1. Sanitize inputs (avoid NaN propagation)
+        # ---------------------------------------
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=1e6, neginf=-1e6)
+        std = torch.nan_to_num(std, nan=1e-3, posinf=1e6, neginf=1e-6)
+        action = torch.nan_to_num(action, nan=0.0, posinf=0.999999, neginf=-0.999999)
         
-        # 初始化损失记录器
-        total_loss = 0
-        policy_losses = []
-        value_losses = []
-        entropy_values = []
-        
-        # 合并采样的数据
-        merged_transition = {
-            'states': [],
-            'actions': [],
-            'rewards': [],
-            'next_states': [],
-            'dones': [],
-            'log_probs': [],
-            'values': []
-        }
-        
-        # 根据action_type选择相应的动作和对数概率键
-        action_key = 'action_shoulder' if action_type == 'shoulder' else 'action_arm'
-        log_prob_key = 'log_prob_shoulder' if action_type == 'shoulder' else 'log_prob_arm'
-        
-        for t in sample_transitions:
-            # 处理状态数据 - 提取图像和状态特征
-            img_data, state_data = t['state']
-            
-            # 确保数据形状正确
-            if isinstance(img_data, np.ndarray):
-                # 确保图像数据是4D形状 [batch_size, channels, height, width]
-                if len(img_data.shape) == 2:  # (H, W) -> (1, 1, H, W)
-                    img_data = img_data.reshape(1, 1, *img_data.shape)
-                elif len(img_data.shape) == 3:  # 处理不同的3D格式
-                    img_data = img_data.reshape(1, 1, *img_data.shape[-2:])
-            
-            # 确保状态数据长度为4
-            if isinstance(state_data, (list, np.ndarray)) and len(state_data) > 4:
-                state_data = state_data[:4]
-            
-            # 合并图像和状态数据作为完整状态
-            full_state = (img_data, state_data)
-            merged_transition['states'].append(full_state)
-            
-            # 添加其他数据
-            merged_transition['actions'].append(t[action_key])
-            merged_transition['rewards'].append(t['reward'])
-            merged_transition['next_states'].append(t['next_state'])
-            merged_transition['dones'].append(t['done'])
-            merged_transition['log_probs'].append(t[log_prob_key])
-            merged_transition['values'].append(t['value'])
-        
-        # 准备状态批次数据用于前向传播
-        states_img = []
-        states_feature = []
-        for img, feature in merged_transition['states']:
-            # 转换为张量
-            if isinstance(img, np.ndarray):
-                img_tensor = torch.from_numpy(img.astype(np.float32)).clone().to(device)
-            else:
-                img_tensor = torch.tensor(img, dtype=torch.float32).to(device)
-            
-            if isinstance(feature, (list, np.ndarray)):
-                feature_tensor = torch.tensor(feature, dtype=torch.float32).to(device)
-            else:
-                feature_tensor = torch.tensor([feature], dtype=torch.float32).to(device)
-            
-            # 确保状态特征长度为4
-            if len(feature_tensor) < 4:
-                feature_tensor = torch.cat([feature_tensor, torch.zeros(4 - len(feature_tensor), device=device)])
-            elif len(feature_tensor) > 4:
-                feature_tensor = feature_tensor[:4]
-            
-            states_img.append(img_tensor)
-            states_feature.append(feature_tensor)
-        
-        # 堆叠为批次
-        states_img_batch = torch.cat(states_img)
-        states_feature_batch = torch.stack(states_feature)
-        
-        # 处理动作和对数概率
-        actions = torch.tensor([float(a.flatten()[0]) if isinstance(a, np.ndarray) else float(a) 
-                                for a in merged_transition['actions']], dtype=torch.float32).to(device)
-        old_log_probs = torch.tensor(merged_transition['log_probs'], dtype=torch.float32).to(device)
-        
-        # 计算GAE优势估计
-        rewards = np.array(merged_transition['rewards'])
-        values = np.array(merged_transition['values'])
-        dones = np.array(merged_transition['dones'])
-        
-        # 计算最后一个状态的价值估计（用于GAE）
-        last_img, last_feature = merged_transition['states'][-1]
+        # clamp std for stability
+        std = torch.clamp(std, 1e-6, 1e3)
+
+        # ---------------------------------------
+        # 2. Atanh (invert tanh) in a numerically stable way
+        # ---------------------------------------
+        # avoid atanh exploding at ±1:
+        eps = 1e-6
+        clipped = action.clamp(-1 + eps, 1 - eps)
+
+        # correct definition of atanh:
+        # atanh(x) = 0.5 * log((1+x)/(1-x))
+        raw = 0.5 * (torch.log1p(clipped) - torch.log1p(-clipped))
+
+        # ---------------------------------------
+        # 3. Normal distribution for raw
+        # ---------------------------------------
+        try:
+            normal = torch.distributions.Normal(mu, std)
+        except Exception as e:
+            print("\n[ERROR] Normal() creation failed in log_prob_tanh_action")
+            print("  mu min/mean/max:", mu.min().item(), mu.mean().item(), mu.max().item())
+            print("  std min/mean/max:", std.min().item(), std.mean().item(), std.max().item())
+            raise
+
+        logp_raw = normal.log_prob(raw)  # shape: [B, act_dim]
+
+        # ---------------------------------------
+        # 4. Tanh squash adjustment:
+        #    logp = logp_raw - log(1 - tanh(raw)^2)
+        # ---------------------------------------
+        # ensure Jacobian is safe: 1 - clipped^2 ∈ (0,1)
+        jacobian = 1 - clipped.pow(2) + 1e-6
+        logp = logp_raw - torch.log(jacobian)
+
+        # ---------------------------------------
+        # 5. Final logp: sum over action dim
+        # ---------------------------------------
+        logp = logp.sum(dim=-1, keepdim=True)
+
+        # ---------------------------------------
+        # 6. Last safety layer (avoid NaN going out)
+        # ---------------------------------------
+        logp = torch.nan_to_num(logp, nan=0.0, posinf=-50.0, neginf=-50.0)
+
+        return logp
+
+
+
+    # ---------- data collection API ----------
+    def choose_action(self, obs_img, obs_state, deterministic=False):
+        """Convert input -> run policy_old -> sample/logp/value -> return numpy scalars."""
+        # convert inputs to tensors
+        if isinstance(obs_img, np.ndarray):
+            img_t = torch.from_numpy(obs_img)
+        else:
+            img_t = obs_img
+
+        if isinstance(obs_state, np.ndarray):
+            st_t = torch.from_numpy(obs_state)
+        elif isinstance(obs_state, list):
+            st_t = torch.tensor(obs_state, dtype=torch.float32)
+        else:
+            st_t = obs_state
+
+        # ensure dims
+        if img_t.dim() == 2:
+            img_t = img_t.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        elif img_t.dim() == 3:
+            img_t = img_t.unsqueeze(0)               # (1,C,H,W)
+        if st_t.dim() == 1:
+            st_t = st_t.unsqueeze(0)
+
+        img_t = img_t.float().to(self.device)
+        st_t = st_t.float().to(self.device)
+
         with torch.no_grad():
-            if isinstance(last_img, np.ndarray):
-                last_img_tensor = torch.from_numpy(last_img.astype(np.float32)).clone().to(device)
+            mu, sigma, value = self.policy_old(img_t, st_t)
+
+            # sanitize outputs
+            mu = torch.nan_to_num(mu, nan=0.0, posinf=1e6, neginf=-1e6)
+            sigma = torch.nan_to_num(sigma, nan=1e-3, posinf=1e6, neginf=1e-6)
+            sigma = torch.clamp(sigma, min=1e-6, max=1e6)
+
+            if deterministic:
+                raw = mu
             else:
-                last_img_tensor = torch.tensor(last_img, dtype=torch.float32).to(device)
-            
-            if isinstance(last_feature, (list, np.ndarray)):
-                last_feature_tensor = torch.tensor(last_feature, dtype=torch.float32).to(device)
-            else:
-                last_feature_tensor = torch.tensor([last_feature], dtype=torch.float32).to(device)
-            
-            # 确保长度为4
-            if len(last_feature_tensor) < 4:
-                last_feature_tensor = torch.cat([last_feature_tensor, torch.zeros(4 - len(last_feature_tensor), device=device)])
-            elif len(last_feature_tensor) > 4:
-                last_feature_tensor = last_feature_tensor[:4]
-            
-            _, _, last_value = self.policy(last_img_tensor, last_feature_tensor)
-            last_value_np = last_value.cpu().numpy()[0]
+                dist = torch.distributions.Normal(mu, sigma)
+                raw = dist.rsample()
+
+            action_raw = torch.tanh(raw)  # in [-1, 1]
+            action = 0.5 * action_raw      # scale to [-0.5, 0.5] for env constraints
+            logp = self.log_prob_tanh_action(mu, sigma, action_raw)
+
+            action_np = action.cpu().numpy().squeeze()
+            logp_f = float(logp.cpu().numpy().squeeze())
+            value_f = float(value.cpu().numpy().squeeze())
+
+        return action_np, logp_f, value_f
+
+
+
+    def store_transition_catch(self, obs_img, obs_state, action, logp, reward, value, done):
+        """
+        存储一步交互数据到 buffer。
+        """
+
+        # ---------- obs_img ----------
+        if isinstance(obs_img, np.ndarray):
+            img_t = torch.from_numpy(obs_img).float()
+        elif isinstance(obs_img, torch.Tensor):
+            img_t = obs_img.detach().cpu().float()
+        else:
+            raise TypeError(f"obs_img type invalid: {type(obs_img)}")
+
+        # ---------- obs_state ----------
+        if isinstance(obs_state, list):
+            st_t = torch.tensor(obs_state, dtype=torch.float32)
+        elif isinstance(obs_state, np.ndarray):
+            st_t = torch.from_numpy(obs_state).float()
+        elif isinstance(obs_state, torch.Tensor):
+            st_t = obs_state.detach().cpu().float()
+        else:
+            raise TypeError(f"obs_state type invalid: {type(obs_state)}")
+
+        # ---------- action ----------
+        if isinstance(action, np.ndarray):
+            a_t = torch.from_numpy(action).float()
+        elif isinstance(action, torch.Tensor):
+            a_t = action.detach().cpu().float()
+        elif isinstance(action, (float, int, np.floating, np.integer)):
+            a_t = torch.tensor([float(action)], dtype=torch.float32)
+        else:
+            raise TypeError(f"action type invalid: {type(action)}")
+
+        # normalize action shape to (act_dim,) or scalar (1)
+        if a_t.ndim == 0:
+            a_t = a_t.unsqueeze(0)
+
+        # ---------- store ----------
+        self.buf_obs_img.append(img_t.clone())
+        self.buf_obs_state.append(st_t.clone())
+        self.buf_actions.append(a_t.clone())
+
+        self.buf_logp.append(float(logp))
+        self.buf_rewards.append(float(reward))
+        self.buf_vals.append(float(value))
+        self.buf_dones.append(bool(done))
+
+
+    # ---------- finish path and GAE ----------
+    def finish_path(self, last_value=0.0):
+        """
+        当一个 episode 结束或在中间截断要计算 returns/advantages 时调用。
+        通过对当前 buffer 中从 path_start_idx 开始到末尾的段计算 GAE，并把 computed returns & advantages 存回 buffer。
+        last_value: 如果不是终止（done==False），由当前策略估计的 next value；否则为 0。
+        """
+        path_slice = slice(self.path_start_idx, len(self.buf_rewards))
+        rewards = np.array(self.buf_rewards[path_slice], dtype=np.float32)
+        values = np.array(self.buf_vals[path_slice], dtype=np.float32)
+        dones = np.array(self.buf_dones[path_slice], dtype=np.bool_)
+
+        # append last_value to values for delta computation
+        values_extended = np.append(values, last_value)
         
-        # 使用compute_gae方法计算优势
-        advantages = self.compute_gae(rewards, values, last_value_np, dones)
-        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
-        returns = advantages + torch.tensor(values, dtype=torch.float32).to(device)
-        
-        # 标准化优势函数
-        if len(advantages) > 1:
-            mean_adv = advantages.mean()
-            std_adv = advantages.std()
-            if std_adv > 1e-8:
-                advantages = (advantages - mean_adv) / (std_adv + 1e-8)
-            else:
-                advantages = advantages - mean_adv
-        
-        # 更新策略网络和价值网络多次
-        total_loss = 0
-        policy_losses = []
-        value_losses = []
-        entropy_values = []
-        
-        update_epochs = min(self.update_epochs, 4)  # 最多4轮更新
-        
-        for epoch in range(update_epochs):
-            # 前向传播获取当前策略的输出
-            with torch.set_grad_enabled(True):
-                # 获取当前策略的均值、标准差和价值估计
-                # 批量处理所有样本，提高计算效率
-                # 调整图像批次形状，确保为[batch_size, 1, 128, 128]格式
-                batch_imgs = states_img_batch.clone()
-                # 移除不必要的批次维度并确保正确的通道维度
-                if batch_imgs.dim() == 5:  # 假设原始形状为[batch_size, 1, 1, 128, 128]
-                    batch_imgs = batch_imgs.squeeze(1)
-                elif batch_imgs.dim() == 4 and batch_imgs.shape[1] == 1:  # [batch_size, 1, 128, 128]
-                    pass  # 已经是正确格式
-                elif batch_imgs.dim() == 4 and batch_imgs.shape[1] > 1:  # 通道维度不在正确位置
-                    batch_imgs = batch_imgs.permute(0, 3, 1, 2)  # 假设原始为[batch_size, 128, 128, 1]
-                elif batch_imgs.dim() == 3:  # [batch_size, 128, 128]
-                    batch_imgs = batch_imgs.unsqueeze(1)  # 添加通道维度
-                
-                # 批量调用policy处理所有样本
-                means, stds, values_pred = self.policy(batch_imgs, states_feature_batch)
-                
-                # 检查是否有NaN值
-                if torch.isnan(means).any() or torch.isnan(stds).any():
-                    print(f"第{epoch+1}轮更新中检测到NaN值")
-                    print(f"Means: {means}")
-                    print(f"Stds: {stds}")
-                    continue
-                
-                # 创建正态分布
-                dist = torch.distributions.Normal(means, stds)
-                
-                # 调整actions的形状以匹配分布的batch_shape+event_shape
-                # 确保actions和means的维度一致
-                if len(means.shape) == 2:  # means形状为[batch_size, action_dim]
-                    # 将actions从[batch_size]调整为[batch_size, action_dim]
-                    actions_reshaped = actions.view(-1, 1).expand_as(means)
-                else:  # 原始的三维情况
-                    actions_reshaped = actions.view(-1, 1, 1).expand_as(means)
-                
-                # 计算新的对数概率
-                log_probs = dist.log_prob(actions_reshaped).sum(dim=-1)
-                
-                # 计算PPO目标，添加安全措施防止NaN
-                log_prob_diff = log_probs - old_log_probs
-                # 裁剪log差值，防止指数操作溢出或产生NaN
-                log_prob_diff = torch.clamp(log_prob_diff, -20, 20)
-                ratios = torch.exp(log_prob_diff)
-                # 进一步裁剪ratios值，确保稳定性
-                ratios = torch.clamp(ratios, 0.1, 10.0)
-                
-                surr1 = ratios * advantages
-                surr2 = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-                
-                # 添加熵正则化
-                entropy = dist.entropy().mean()
-                policy_loss -= self.entropy_coef * entropy
-                
-                # 计算价值损失
-                value_loss = F.mse_loss(values_pred.squeeze(-1), returns)
-                
-                # 组装总损失
-                loss = policy_loss + self.value_coef * value_loss
+        # GAE
+        advantages = np.zeros_like(rewards)
+        lastgaelam = 0
+        for t in reversed(range(len(rewards))):
+            nonterminal = 1.0 - float(dones[t])
+            delta = rewards[t] + self.gamma * values_extended[t + 1] * nonterminal - values_extended[t]
+            lastgaelam = delta + self.gamma * self.lam * nonterminal * lastgaelam
+            advantages[t] = lastgaelam
+
+        returns = advantages + values
+
+        # store as lists aligned with buffer
+        # we will attach advantage & returns arrays to lists parallel to buf_rewards
+        if not hasattr(self, 'buf_adv'):
+            self.buf_adv = []
+            self.buf_ret = []
+        # extend with computed ones
+        self.buf_adv.extend(advantages.tolist())
+        self.buf_ret.extend(returns.tolist())
+
+        # move path start
+        self.path_start_idx = len(self.buf_rewards)
             
-            # 更新策略网络
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward(retain_graph=False)
-            
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            # 记录损失值
-            loss_val = loss.item()
-            policy_loss_val = policy_loss.item()
-            value_loss_val = value_loss.item()
-            entropy_val = entropy.item()
-            
-            total_loss += loss_val
-            policy_losses.append(policy_loss_val)
-            value_losses.append(value_loss_val)
-            entropy_values.append(entropy_val)
-            
-            # print(f"第{epoch+1}/{update_epochs}轮更新 - 损失: {loss_val:.4f}, 策略损失: {policy_loss_val:.4f}, 价值损失: {value_loss_val:.4f}")
-        
-        # 计算平均损失值
-        avg_loss = total_loss / len(policy_losses) if policy_losses else 0
-        avg_policy_loss = sum(policy_losses) / len(policy_losses) if policy_losses else 0
-        avg_value_loss = sum(value_losses) / len(value_losses) if value_losses else 0
-        avg_entropy = sum(entropy_values) / len(entropy_values) if entropy_values else 0
-        
-        # 更新学习率（如果使用学习率调度器）
-        if hasattr(self, 'scheduler') and self.scheduler is not None:
-            self.scheduler.step()
-        
-        # 返回平均损失值
-        return avg_loss, avg_policy_loss, avg_value_loss, avg_entropy
+    # ---------- main update (PPO) ----------
+    def learn(self):
+        """
+        对当前收集到的 on-policy 数据执行 PPO 更新。
+        要求在调用前已对所有正在进行的 episode 调用 finish_path(last_value)（对未终止 episode 提供 bootstrap value）。
+        """
+        # collect all data as tensors
+        n = len(self.buf_rewards)
+        if n == 0:
+            return dict(loss=0.0, policy_loss=0.0, value_loss=0.0, entropy=0.0)
+
+        # ensure advantages and returns exist for all steps
+        assert hasattr(self, 'buf_adv') and len(self.buf_adv) == n, "Must call finish_path for all trajectories before update()"
+
+        # stack tensors and move to device
+        obs_imgs = torch.stack([t.float() for t in self.buf_obs_img]).to(self.device)
+        obs_states = torch.stack([t.float() for t in self.buf_obs_state]).to(self.device)
+        actions = torch.stack([t.float() for t in self.buf_actions]).to(self.device)
+        old_logp = torch.tensor(self.buf_logp, dtype=torch.float32, device=self.device)
+        returns = torch.tensor(self.buf_ret, dtype=torch.float32, device=self.device)
+        raw_advantages = torch.tensor(self.buf_adv, dtype=torch.float32, device=self.device)
+
+        # 对 actor 保留一部分 advantage 的原始尺度信息。
+        # 纯标准化会把不同 update 之间的策略改进强度压到近似同一量级，
+        # 导致 policy_loss 长期围绕极小值波动，不利于观察真实变化。
+        adv_mean = raw_advantages.mean()
+        adv_std = raw_advantages.std(unbiased=False)
+        advantages = (raw_advantages - adv_mean) / (adv_std + 1e-8)
+        adv_scale = torch.clamp(adv_std.detach(), min=0.5, max=10.0)
+        actor_advantages = advantages * adv_scale
+
+        # --- Enhanced safety checks: skip update if returns/advantages contain NaN/Inf or are extreme ---
+        try:
+            if (not torch.isfinite(returns).all()) or (not torch.isfinite(raw_advantages).all()) or (not torch.isfinite(actor_advantages).all()):
+                print("[PPO.learn] Skipping update: returns/advantages contain NaN/Inf")
+                return dict(loss=0.0, policy_loss=0.0, value_loss=0.0, entropy=0.0, log_std_mean=0.0, log_std_grad_norm=0.0, mean_sigma=0.0, skipped=True)
+            # 放宽阈值，从1e4提高到1e5，允许更多正常更新
+            if returns.abs().max() > 1e5 or raw_advantages.abs().max() > 1e5 or actor_advantages.abs().max() > 1e5:
+                print(
+                    f"[PPO.learn] Skipping update: returns/advantages too large "
+                    f"(returns_max={returns.abs().max().item():.2f}, raw_adv_max={raw_advantages.abs().max().item():.2f}, "
+                    f"actor_adv_max={actor_advantages.abs().max().item():.2f})"
+                )
+                return dict(loss=0.0, policy_loss=0.0, value_loss=0.0, entropy=0.0, log_std_mean=0.0, log_std_grad_norm=0.0, mean_sigma=0.0, skipped=True)
+        except Exception as e:
+            # If any unexpected error during safety checks, skip update
+            print(f"[PPO.learn] Safety check error: {e}, skipping update.")
+            return dict(loss=0.0, policy_loss=0.0, value_loss=0.0, entropy=0.0, log_std_mean=0.0, log_std_grad_norm=0.0, mean_sigma=0.0, skipped=True)
+
+        dataset = TensorDataset(obs_imgs, obs_states, actions, old_logp, returns, actor_advantages)
+        dataloader = DataLoader(dataset, batch_size=self.minibatch_size, shuffle=True)
+
+        # --- [新增] 在开始更新前保存 policy 备份，用于异常时回滚 ---
+        from copy import deepcopy
+        policy_backup = deepcopy(self.policy.state_dict())
+
+        # update policy_old to current policy params BEFORE updating? No: PPO uses old policy stored at data collection time.
+        # policy_old was saved when collecting data (we must ensure that before collecting we called policy_old.load_state_dict(policy.state_dict()))
+        # We'll perform K epochs of SGD on the collected dataset
+        total_loss = 0.0
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        iters = 0
+
+        for epoch in range(self.update_epochs):
+            for batch in dataloader:
+                b_imgs, b_states, b_actions, b_old_logp, b_returns, b_adv = [x.to(self.device) for x in batch]
+
+                # 保证 logp 和 advantage 在计算比值时拥有匹配的形状 [B, 1]，
+                # 否则广播会把每个样本同批次其它样本混在一起，导致 policy_loss 恒为 0。
+                if b_old_logp.dim() == 1:
+                    b_old_logp = b_old_logp.unsqueeze(-1)
+                if b_adv.dim() == 1:
+                    b_adv = b_adv.unsqueeze(-1)
+
+                # new policy evaluation
+                mu, sigma, value_pred = self.policy(b_imgs, b_states)  # shapes: [B,act_dim], [B,act_dim], [B,1]
+                sigma = torch.clamp(sigma, 1e-6, 1e6)
+                # compute new log prob for given (tanh-ed) actions
+                # ---------- debug & defensive checks before computing logp ----------
+                # b_imgs, b_states, b_actions, mu, sigma are tensors in shapes you expect
+                # Print shapes and some stats if NaN or Inf detected
+                if torch.isnan(mu).any() or torch.isinf(mu).any() or torch.isnan(sigma).any() or torch.isinf(sigma).any():
+                    print("[PPO::learn] Detected NaN/Inf in policy outputs BEFORE computing logp.")
+                    print(" mu stats: nan_any=%s, inf_any=%s, min/mean/max: %s/%s/%s" % (
+                        torch.isnan(mu).any().item(), torch.isinf(mu).any().item(),
+                        None if mu.numel()==0 else mu.min().item(), None if mu.numel()==0 else mu.mean().item(), None if mu.numel()==0 else mu.max().item()
+                    ))
+                    print(" sigma stats: nan_any=%s, inf_any=%s, min/mean/max: %s/%s/%s" % (
+                        torch.isnan(sigma).any().item(), torch.isinf(sigma).any().item(),
+                        None if sigma.numel()==0 else sigma.min().item(), None if sigma.numel()==0 else sigma.mean().item(), None if sigma.numel()==0 else sigma.max().item()
+                    ))
+                    # Also inspect inputs
+                    print(" b_imgs shape:", getattr(b_imgs, "shape", None))
+                    print(" b_states shape:", getattr(b_states, "shape", None))
+                    print(" b_actions shape:", getattr(b_actions, "shape", None))
+                    # Dump first few entries for mu/sigma
+                    print(" mu[0:5]:", mu.view(-1)[:5].detach().cpu().numpy())
+                    print(" sigma[0:5]:", sigma.view(-1)[:5].detach().cpu().numpy())
+                    # Fallback: sanitize mu/sigma to safe values to allow training to continue
+                    mu = torch.nan_to_num(mu, nan=0.0, posinf=1e6, neginf=-1e6)
+                    sigma = torch.nan_to_num(sigma, nan=1e-3, posinf=1e6, neginf=1e-6)
+                    sigma = torch.clamp(sigma, 1e-6, 1e3)
+
+                # 由于 choose_action 里用了 0.5 缩放，计算 logp 时需要还原到 tanh(raw) 的尺度
+                new_logp = self.log_prob_tanh_action(mu, sigma, b_actions * 2.0)
+                # ratio
+                ratio = torch.exp(new_logp - b_old_logp)
+                # clipped surrogate
+                surr1 = ratio * b_adv
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * b_adv
+                policy_loss = -torch.mean(torch.min(surr1, surr2))
+                # entropy (for exploration)
+                normal = torch.distributions.Normal(mu, sigma)
+                # differential entropy of normal: sum(log(sigma) + 0.5*log(2*pi*e))
+                ent = normal.entropy().sum(dim=-1).mean()
+
+                # value loss (MSE)
+                value_pred = value_pred.view(-1)
+                value_loss = F.mse_loss(value_pred, b_returns)
+
+                loss = policy_loss - self.entropy_coef * ent + self.value_coef * value_loss
+
+                # --- [修复] 确保每个 batch 后立即 step 和 zero_grad，防止梯度累积 ---
+                self.optimizer.zero_grad()
+                loss.backward()
+                # gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+
+                # --- [增强] 每个 batch 后检查是否有异常，如果有则回滚并跳过整个更新 ---
+                try:
+                    # 检查是否有 NaN/Inf 在 loss 中，放宽阈值
+                    if not torch.isfinite(loss) or loss.abs().item() > 1e4:
+                        print(f"[PPO::learn] Detected invalid loss after step: {loss.item():.4f}. Rolling back parameters.")
+                        self.policy.load_state_dict(policy_backup)
+                        self.policy_old.load_state_dict(policy_backup)
+                        return dict(loss=0.0, policy_loss=0.0, value_loss=0.0, entropy=0.0,
+                                    log_std_mean=0.0, log_std_grad_norm=0.0, mean_sigma=0.0, skipped=True)
+
+                    # 检查参数是否变得无效，放宽阈值
+                    for name, param in self.policy.named_parameters():
+                        if not torch.isfinite(param).all() or param.abs().max().item() > 1e5:
+                            print(f"[PPO::learn] Detected invalid parameter '{name}' max={param.abs().max().item():.4f}. Rolling back parameters.")
+                            self.policy.load_state_dict(policy_backup)
+                            self.policy_old.load_state_dict(policy_backup)
+                            return dict(loss=0.0, policy_loss=0.0, value_loss=0.0, entropy=0.0,
+                                        log_std_mean=0.0, log_std_grad_norm=0.0, mean_sigma=0.0, skipped=True)
+                except Exception as e:
+                    print(f"[PPO::learn] Error during safety check: {e}. Rolling back parameters.")
+                    self.policy.load_state_dict(policy_backup)
+                    self.policy_old.load_state_dict(policy_backup)
+                    return dict(loss=0.0, policy_loss=0.0, value_loss=0.0, entropy=0.0,
+                                log_std_mean=0.0, log_std_grad_norm=0.0, mean_sigma=0.0, skipped=True)
+
+                total_loss += loss.item()
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += ent.item()
+                iters += 1
+
+        # after update, sync policy_old <- policy
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+        # 记录 log_std 的均值和梯度范数（如果存在）
+        log_std_mean = 0.0
+        log_std_grad_norm = 0.0
+        mean_sigma = 0.0
+        try:
+            if hasattr(self.policy, 'log_std_layer'):
+                with torch.no_grad():
+                    bias = self.policy.log_std_layer.bias
+                    log_std_mean = float(bias.mean().cpu().item())
+                    mean_sigma = float(torch.exp(bias.mean()).cpu().item())
+                # 梯度范数（可能为 None）
+                grads = [p.grad.norm().cpu().item() for p in self.policy.log_std_layer.parameters() if p.grad is not None]
+                if grads:
+                    log_std_grad_norm = float(sum(grads))
+        except Exception:
+            pass
+
+        # clear buffer
+        self.reset_buffer()
+        # also drop buf_adv/ret
+        if hasattr(self, 'buf_adv'):
+            try:
+                del self.buf_adv
+                del self.buf_ret
+            except Exception:
+                pass
+
+        return dict(loss=total_loss / max(1, iters),
+                    policy_loss=total_policy_loss / max(1, iters),
+                    value_loss=total_value_loss / max(1, iters),
+                    entropy=total_entropy / max(1, iters),
+                    log_std_mean=log_std_mean,
+                    log_std_grad_norm=log_std_grad_norm,
+                    mean_sigma=mean_sigma)
+
+    # ---------- helper to bootstrap unfinished episode ----------
+    def finish_path_with_value(self, last_img, last_state):
+        """
+        当你在 update 前希望对仍未结束的 episode 做 bootstrap（即不是 done），
+        使用当前 policy 计算 last_value 并调用 finish_path(last_value)
+        """
+        # prepare tensors
+        if isinstance(last_img, np.ndarray):
+            img_t = torch.tensor(last_img, dtype=torch.float32, device=self.device).unsqueeze(0)
+        else:
+            img_t = last_img.to(self.device).unsqueeze(0).float()
+
+        if isinstance(last_state, np.ndarray):
+            st_t = torch.tensor(last_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        else:
+            st_t = last_state.to(self.device).unsqueeze(0).float()
+
+        with torch.no_grad():
+            _, _, last_value = self.policy_old(img_t, st_t)
+            last_value = float(last_value.cpu().numpy().squeeze())
+        self.finish_path(last_value=last_value)
+
+    # ---------- convenience: call at start of data-collection to freeze old policy ----------
+    def start_collection(self):
+        """
+        在开始新一轮数据收集前调用（把 policy 的当前参数 copy 到 policy_old）。
+        典型流程：
+          ppo.start_collection()
+          for t in range(T): interact and store_transition(...)
+          for each episode: finish_path(...)  # includes bootstrap for last incomplete traj
+          ppo.update()
+        """
+        self.policy_old.load_state_dict(self.policy.state_dict())
