@@ -1,5 +1,6 @@
 import time
 from python_scripts.Project_config import Darwin_config
+from python_scripts.Webots_interfaces import Environment
 
 def wait_for_sensors_stable(env, max_retries=30, wait_ms=200):
     """

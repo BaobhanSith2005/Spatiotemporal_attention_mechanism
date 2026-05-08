@@ -1,4 +1,5 @@
 import json
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from matplotlib.figure import Figure
@@ -7,38 +8,72 @@ import matplotlib.colors as mcolors
 from collections import OrderedDict
 
 try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
     from scipy.signal import savgol_filter
 except ImportError:
     savgol_filter = None
 
+SCHEME_NAMES_ZH = {
+    'ColorBrewer Set1': 'ColorBrewer 集合1',
+    'ColorBrewer Set2': 'ColorBrewer 集合2',
+    'ColorBrewer Set3': 'ColorBrewer 集合3',
+    'ColorBrewer Dark2': 'ColorBrewer 深色2',
+    'ColorBrewer Paired': 'ColorBrewer 配对',
+    'Tableau 10': 'Tableau 10色',
+    'Tableau 20': 'Tableau 20色',
+    'Okabe-Ito (Colorblind)': 'Okabe-Ito (色盲友好)',
+    'Wong (Colorblind)': 'Wong (色盲友好)',
+    'Tol Bright': 'Tol 明亮',
+    'Tol Vibrant': 'Tol 鲜艳',
+    'Nature Style': 'Nature 风格',
+    'Science Style': 'Science 风格',
+    'IEEE Standard': 'IEEE 标准',
+    'Matplotlib Default': 'Matplotlib 默认',
+    'Seaborn Deep': 'Seaborn 深色',
+    'Seaborn Colorblind': 'Seaborn 色盲友好',
+    'Viridis': 'Viridis',
+    'Plasma': 'Plasma',
+    'Inferno': 'Inferno',
+    'Magma': 'Magma',
+    'Cividis': 'Cividis'
+}
+
+SCHEME_NAMES_REVERSE = {value: key for key, value in SCHEME_NAMES_ZH.items()}
+
+COLOR_SCHEMES = {
+    'ColorBrewer Set1': ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33', '#a65628', '#f781bf', '#999999', '#66c2a5', '#fc8d62', '#8da0cb'],
+    'ColorBrewer Set2': ['#66c2a5', '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854', '#ffd92f', '#e5c494', '#b3b3b3', '#8dd3c7', '#ffffb3', '#bebada', '#fb8072'],
+    'ColorBrewer Set3': ['#8dd3c7', '#ffffb3', '#bebada', '#fb8072', '#80b1d3', '#fdb462', '#b3de69', '#fccde5', '#d9d9d9', '#bc80bd', '#ccebc5', '#ffed6f'],
+    'ColorBrewer Dark2': ['#1b9e77', '#d95f02', '#7570b3', '#e7298a', '#66a61e', '#e6ab02', '#a6761d', '#666666', '#1f78b4', '#33a02c', '#fb9a99', '#fdbf6f'],
+    'ColorBrewer Paired': ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00', '#cab2d6', '#6a3d9a', '#ffff99', '#b15928'],
+    'Tableau 10': ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab'],
+    'Tableau 20': ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab', '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'],
+    'Okabe-Ito (Colorblind)': ['#000000', '#e69f00', '#56b4e9', '#009e73', '#f0e442', '#0072b2', '#d55e00', '#cc79a7', '#999999', '#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c'],
+    'Wong (Colorblind)': ['#000000', '#e69f00', '#56b4e9', '#009e73', '#f0e442', '#0072b2', '#d55e00', '#cc79a7', '#cccccc', '#882255', '#332288', '#117733', '#44aa99', '#999933', '#aa4499'],
+    'Tol Bright': ['#4477aa', '#ee6677', '#228833', '#ccbb44', '#66ccee', '#aa3377', '#bbbbbb', '#ee7733', '#009988', '#eecc66', '#994455', '#997700', '#999999'],
+    'Tol Vibrant': ['#0077bb', '#33bbee', '#009988', '#ee7733', '#cc3311', '#ee3377', '#bbbbbb', '#332288', '#88ccee', '#44aa99', '#117733', '#999933', '#ddcc77'],
+    'Nature Style': ['#0072b2', '#d55e00', '#009e73', '#cc79a7', '#f0e442', '#56b4e9', '#e69f00', '#000000', '#52854c', '#ffdb6d', '#d16103', '#c4961a', '#293352'],
+    'Science Style': ['#3b4992', '#ee0000', '#008b45', '#631879', '#008280', '#bb0021', '#5f559b', '#a20056', '#808180', '#1b1919', '#0f8b8d', '#91d1c2', '#f39b7f'],
+    'IEEE Standard': ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'],
+    'Matplotlib Default': ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'],
+    'Seaborn Deep': ['#4c72b0', '#dd8452', '#55a868', '#c44e52', '#8172b3', '#937860', '#da8bc3', '#8c8c8c', '#ccb974', '#64b5cd', '#8dd3c7', '#ccb974', '#e1c72b', '#7f7f7f', '#e377c2'],
+    'Seaborn Colorblind': ['#0072b2', '#e69f00', '#009e73', '#cc79a7', '#56b4e9', '#f0e442', '#d55e00', '#000000', '#882255', '#332288', '#117733', '#44aa99', '#999933', '#aa4499', '#ddcc77'],
+    'Viridis': ['#440154', '#472d7b', '#3b528b', '#2c728e', '#21918c', '#27ae80', '#5ec962', '#a0da39', '#fde725', '#f0f921', '#e6e600', '#ffff88', '#ffea00', '#ffb000', '#ff6b00'],
+    'Plasma': ['#0d0887', '#46039f', '#7201a8', '#9c179e', '#bd3786', '#d8576b', '#ed7953', '#fb9f3a', '#fdca26', '#f0f921', '#ffff88', '#ffe617', '#ffcc00', '#ffa500', '#ff6b00'],
+    'Inferno': ['#000004', '#1b0c41', '#4a0c6b', '#781c6d', '#a52c60', '#cf4446', '#ed6925', '#fb9b06', '#f7d13d', '#fcffa4', '#ffff88', '#ffe617', '#ffcc00', '#ffa500', '#ff6b00'],
+    'Magma': ['#000004', '#180f3d', '#440f76', '#721f81', '#9e2f7f', '#cd4071', '#f1605d', '#fd9567', '#fec98d', '#fcfebf', '#ffff88', '#ffe617', '#ffcc00', '#ffa500', '#ff6b00'],
+    'Cividis': ['#00204d', '#00336e', '#1d4e89', '#3d679e', '#5a7fb0', '#7b9bc4', '#9fb7d7', '#c4d2e9', '#e8e8e8', '#f1e8c6', '#f9e1a1', '#fcd678', '#fac228', '#f5a000', '#e67e00']
+}
+
 class ColorPickerDialog:
     """科研配色选择器对话框"""
     def __init__(self, parent, current_color, color_schemes):
-        # 中文配色方案名称映射
-        self.scheme_names_zh = {
-            'ColorBrewer Set1': 'ColorBrewer 集合1',
-            'ColorBrewer Set2': 'ColorBrewer 集合2',
-            'ColorBrewer Set3': 'ColorBrewer 集合3',
-            'ColorBrewer Dark2': 'ColorBrewer 深色2',
-            'ColorBrewer Paired': 'ColorBrewer 配对',
-            'Tableau 10': 'Tableau 10色',
-            'Tableau 20': 'Tableau 20色',
-            'Okabe-Ito (Colorblind)': 'Okabe-Ito (色盲友好)',
-            'Wong (Colorblind)': 'Wong (色盲友好)',
-            'Tol Bright': 'Tol 明亮',
-            'Tol Vibrant': 'Tol 鲜艳',
-            'Nature Style': 'Nature 风格',
-            'Science Style': 'Science 风格',
-            'IEEE Standard': 'IEEE 标准',
-            'Matplotlib Default': 'Matplotlib 默认',
-            'Seaborn Deep': 'Seaborn 深色',
-            'Seaborn Colorblind': 'Seaborn 色盲友好',
-            'Viridis': 'Viridis',
-            'Plasma': 'Plasma',
-            'Inferno': 'Inferno',
-            'Magma': 'Magma',
-            'Cividis': 'Cividis'
-        }
+        self.scheme_names_zh = SCHEME_NAMES_ZH
+        self.scheme_names_reverse = SCHEME_NAMES_REVERSE
         self.parent = parent
         self.current_color = current_color
         self.color_schemes = color_schemes
@@ -63,9 +98,6 @@ class ColorPickerDialog:
         ttk.Label(main_frame, text="Color Scheme:").pack(anchor=tk.W, pady=(0,5))
 
         self.scheme_var = tk.StringVar()
-        # 创建中文名称到英文键的反向映射
-        self.scheme_names_reverse = {v: k for k, v in self.scheme_names_zh.items()}
-
         # 默认选中第一个配色方案
         first_scheme_zh = list(self.scheme_names_zh.values())[0]
         self.scheme_var.set(first_scheme_zh)
@@ -327,31 +359,7 @@ class MultiCurveChartApp:
         self.file_labels = {}  # 文件名 -> 自定义标签                                                
         self.file_colors = {}  # 文件名 -> 颜色
         
-        # 科研标准配色方案（扩展版）
-        self.color_schemes = {
-            'ColorBrewer Set1': ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33', '#a65628', '#f781bf', '#999999', '#66c2a5', '#fc8d62', '#8da0cb'],
-            'ColorBrewer Set2': ['#66c2a5', '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854', '#ffd92f', '#e5c494', '#b3b3b3', '#8dd3c7', '#ffffb3', '#bebada', '#fb8072'],
-            'ColorBrewer Set3': ['#8dd3c7', '#ffffb3', '#bebada', '#fb8072', '#80b1d3', '#fdb462', '#b3de69', '#fccde5', '#d9d9d9', '#bc80bd', '#ccebc5', '#ffed6f'],
-            'ColorBrewer Dark2': ['#1b9e77', '#d95f02', '#7570b3', '#e7298a', '#66a61e', '#e6ab02', '#a6761d', '#666666', '#1f78b4', '#33a02c', '#fb9a99', '#fdbf6f'],
-            'ColorBrewer Paired': ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00', '#cab2d6', '#6a3d9a', '#ffff99', '#b15928'],
-            'Tableau 10': ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab'],
-            'Tableau 20': ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab', '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'],
-            'Okabe-Ito (Colorblind)': ['#000000', '#e69f00', '#56b4e9', '#009e73', '#f0e442', '#0072b2', '#d55e00', '#cc79a7', '#999999', '#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c'],
-            'Wong (Colorblind)': ['#000000', '#e69f00', '#56b4e9', '#009e73', '#f0e442', '#0072b2', '#d55e00', '#cc79a7', '#cccccc', '#882255', '#332288', '#117733', '#44aa99', '#999933', '#aa4499'],
-            'Tol Bright': ['#4477aa', '#ee6677', '#228833', '#ccbb44', '#66ccee', '#aa3377', '#bbbbbb', '#ee7733', '#009988', '#eecc66', '#994455', '#997700', '#999999'],
-            'Tol Vibrant': ['#0077bb', '#33bbee', '#009988', '#ee7733', '#cc3311', '#ee3377', '#bbbbbb', '#332288', '#88ccee', '#44aa99', '#117733', '#999933', '#ddcc77'],
-            'Nature Style': ['#0072b2', '#d55e00', '#009e73', '#cc79a7', '#f0e442', '#56b4e9', '#e69f00', '#000000', '#52854c', '#ffdb6d', '#d16103', '#c4961a', '#293352'],
-            'Science Style': ['#3b4992', '#ee0000', '#008b45', '#631879', '#008280', '#bb0021', '#5f559b', '#a20056', '#808180', '#1b1919', '#0f8b8d', '#91d1c2', '#f39b7f'],
-            'IEEE Standard': ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'],
-            'Matplotlib Default': ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'],
-            'Seaborn Deep': ['#4c72b0', '#dd8452', '#55a868', '#c44e52', '#8172b3', '#937860', '#da8bc3', '#8c8c8c', '#ccb974', '#64b5cd', '#8dd3c7', '#ccb974', '#e1c72b', '#7f7f7f', '#e377c2'],
-            'Seaborn Colorblind': ['#0072b2', '#e69f00', '#009e73', '#cc79a7', '#56b4e9', '#f0e442', '#d55e00', '#000000', '#882255', '#332288', '#117733', '#44aa99', '#999933', '#aa4499', '#ddcc77'],
-            'Viridis': ['#440154', '#472d7b', '#3b528b', '#2c728e', '#21918c', '#27ae80', '#5ec962', '#a0da39', '#fde725', '#f0f921', '#e6e600', '#ffff88', '#ffea00', '#ffb000', '#ff6b00'],
-            'Plasma': ['#0d0887', '#46039f', '#7201a8', '#9c179e', '#bd3786', '#d8576b', '#ed7953', '#fb9f3a', '#fdca26', '#f0f921', '#ffff88', '#ffe617', '#ffcc00', '#ffa500', '#ff6b00'],
-            'Inferno': ['#000004', '#1b0c41', '#4a0c6b', '#781c6d', '#a52c60', '#cf4446', '#ed6925', '#fb9b06', '#f7d13d', '#fcffa4', '#ffff88', '#ffe617', '#ffcc00', '#ffa500', '#ff6b00'],
-            'Magma': ['#000004', '#180f3d', '#440f76', '#721f81', '#9e2f7f', '#cd4071', '#f1605d', '#fd9567', '#fec98d', '#fcfebf', '#ffff88', '#ffe617', '#ffcc00', '#ffa500', '#ff6b00'],
-            'Cividis': ['#00204d', '#00336e', '#1d4e89', '#3d679e', '#5a7fb0', '#7b9bc4', '#9fb7d7', '#c4d2e9', '#e8e8e8', '#f1e8c6', '#f9e1a1', '#fcd678', '#fac228', '#f5a000', '#e67e00']
-        }
+        self.color_schemes = COLOR_SCHEMES
 
         # 默认配色方案
         self.current_scheme = 'Tableau 20'
@@ -360,36 +368,13 @@ class MultiCurveChartApp:
         
         # 初始化所有Tkinter变量
         self.smooth_enabled = tk.BooleanVar(value=False)
+        self.mean_shadow_enabled = tk.BooleanVar(value=True)
         self.window_length = tk.IntVar(value=5)
         self.polyorder = tk.IntVar(value=2)
+        self.mean_shadow_window = tk.IntVar(value=25)
 
-        # 中文配色方案名称映射
-        self.scheme_names_zh = {
-            'ColorBrewer Set1': 'ColorBrewer 集合1',
-            'ColorBrewer Set2': 'ColorBrewer 集合2',
-            'ColorBrewer Set3': 'ColorBrewer 集合3',
-            'ColorBrewer Dark2': 'ColorBrewer 深色2',
-            'ColorBrewer Paired': 'ColorBrewer 配对',
-            'Tableau 10': 'Tableau 10色',
-            'Tableau 20': 'Tableau 20色',
-            'Okabe-Ito (Colorblind)': 'Okabe-Ito (色盲友好)',
-            'Wong (Colorblind)': 'Wong (色盲友好)',
-            'Tol Bright': 'Tol 明亮',
-            'Tol Vibrant': 'Tol 鲜艳',
-            'Nature Style': 'Nature 风格',
-            'Science Style': 'Science 风格',
-            'IEEE Standard': 'IEEE 标准',
-            'Matplotlib Default': 'Matplotlib 默认',
-            'Seaborn Deep': 'Seaborn 深色',
-            'Seaborn Colorblind': 'Seaborn 色盲友好',
-            'Viridis': 'Viridis',
-            'Plasma': 'Plasma',
-            'Inferno': 'Inferno',
-            'Magma': 'Magma',
-            'Cividis': 'Cividis'
-        }
-        # 创建中文名称到英文键的反向映射
-        self.scheme_names_reverse = {v: k for k, v in self.scheme_names_zh.items()}
+        self.scheme_names_zh = SCHEME_NAMES_ZH
+        self.scheme_names_reverse = SCHEME_NAMES_REVERSE
         
         # 初始化界面组件
         self.create_widgets()
@@ -406,7 +391,7 @@ class MultiCurveChartApp:
         
         ttk.Button(
             file_frame,
-            text="Add JSON Files",
+            text="Add Data Files",
             command=self.add_multiple_files  # 支持多文件选择
         ).pack(side=tk.LEFT, padx=2)
         
@@ -434,6 +419,23 @@ class MultiCurveChartApp:
             text="Refresh Chart",
             command=self.update_chart
         ).pack(side=tk.LEFT, padx=5)
+
+        ttk.Checkbutton(
+            axis_frame,
+            text="Mean + Range Shadow",
+            variable=self.mean_shadow_enabled,
+            command=self.update_chart
+        ).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(axis_frame, text="Mean Window:").pack(side=tk.LEFT, padx=(8,2))
+        ttk.Spinbox(
+            axis_frame,
+            from_=1,
+            to=5000,
+            increment=1,
+            textvariable=self.mean_shadow_window,
+            width=6
+        ).pack(side=tk.LEFT, padx=(0,5))
         
         # 右侧控制面板
         control_right = ttk.Frame(control_frame)
@@ -496,7 +498,13 @@ class MultiCurveChartApp:
         list_frame = ttk.LabelFrame(main_frame, text="Loaded Files", padding=5)
         list_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
         
-        self.file_listbox = tk.Listbox(list_frame, width=30, height=20)
+        self.file_listbox = tk.Listbox(
+            list_frame,
+            width=30,
+            height=20,
+            selectmode=tk.EXTENDED,
+            exportselection=False
+        )
         self.file_listbox.pack(fill=tk.BOTH, expand=True)
         
         # 文件列表按钮
@@ -574,6 +582,13 @@ class MultiCurveChartApp:
         except Exception as e:
             messagebox.showerror("Smoothing Error", str(e))
             return y_data
+
+    def get_mean_shadow_window(self):
+        """获取 Mean + Range Shadow 使用的滑动窗口大小。"""
+        try:
+            return max(1, int(self.mean_shadow_window.get()))
+        except Exception:
+            return 25
     
     def save_chart(self):
         """保存图表到文件"""
@@ -609,8 +624,15 @@ class MultiCurveChartApp:
     def add_multiple_files(self):
         """添加多个JSON文件 - 支持同时选择多个文件"""
         file_paths = filedialog.askopenfilenames(
-            filetypes=[("JSON files", "*.json")],
-            title="Select JSON Files - Multiple Selection Supported"
+            filetypes=[
+                ("Data files", "*.json *.xlsx *.xls *.csv *.txt"),
+                ("JSON files", "*.json"),
+                ("Excel files", "*.xlsx *.xls"),
+                ("CSV files", "*.csv"),
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+            title="Select Data Files - Multiple Selection Supported"
         )
         
         if file_paths:
@@ -620,16 +642,16 @@ class MultiCurveChartApp:
             for file_path in file_paths:
                 try:
                     if self.load_file_data(file_path):
-                        filename = file_path.split('/')[-1]  # 获取文件名
+                        filename = os.path.basename(file_path)
                         
                         # 检查是否已经加载了该文件
                         if filename in self.file_data:
                             # 如果文件已存在，添加数字后缀
-                            base_name = filename.replace('.json', '')
+                            base_name, ext = os.path.splitext(filename)
                             counter = 1
-                            while f"{base_name}_{counter}.json" in self.file_data:
+                            while f"{base_name}_{counter}{ext}" in self.file_data:
                                 counter += 1
-                            filename = f"{base_name}_{counter}.json"
+                            filename = f"{base_name}_{counter}{ext}"
                         
                         self.file_data[filename] = self.temp_data
                         
@@ -660,7 +682,28 @@ class MultiCurveChartApp:
     def load_file_data(self, file_path):
         """加载单个文件的数据"""
         try:
-            with open(file_path, 'r') as f:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext != ".json":
+                if pd is None:
+                    messagebox.showerror("Error", "Please install pandas/openpyxl to load Excel, CSV, or TXT files.")
+                    return False
+
+                if ext in (".xlsx", ".xls"):
+                    df = pd.read_excel(file_path)
+                elif ext == ".csv":
+                    df = pd.read_csv(file_path)
+                elif ext == ".txt":
+                    df = pd.read_csv(file_path, sep=None, engine="python")
+                else:
+                    return False
+
+                self.temp_data = {
+                    str(column): df[column].dropna().tolist()
+                    for column in df.columns
+                }
+                return True
+
+            with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 
             # 强制转换为字典格式
@@ -678,6 +721,7 @@ class MultiCurveChartApp:
             self.temp_data = processed_data
             return True
         except Exception as e:
+            print(f"Failed to load {file_path}: {e}")
             return False
     
     def update_file_list(self):
@@ -706,25 +750,42 @@ class MultiCurveChartApp:
             all_keys.update(data.keys())
         
         if all_keys:
-            keys = ['num'] + list(all_keys)
+            sorted_keys = sorted(all_keys)
+            keys = ['num'] + sorted_keys
             self.x_axis_combobox['values'] = keys
-            self.y_axis_combobox['values'] = list(all_keys)
+            self.y_axis_combobox['values'] = sorted_keys
             
             # 设置默认值
             if not self.x_axis_combobox.get():
-                self.x_axis_combobox.set('num')
+                self.x_axis_combobox.set('episode' if 'episode' in all_keys else 'num')
             if not self.y_axis_combobox.get() and all_keys:
-                self.y_axis_combobox.set(next(iter(all_keys)))
+                self.y_axis_combobox.set('reward' if 'reward' in all_keys else sorted_keys[0])
+
+    def get_selected_filenames(self):
+        """获取文件列表中当前选中的文件名列表。"""
+        filenames = list(self.file_data.keys())
+        return [
+            filenames[index]
+            for index in self.file_listbox.curselection()
+            if 0 <= index < len(filenames)
+        ]
+
+    def get_single_selected_filename(self, action_name):
+        """获取单个选中文件；用于只支持单选的操作。"""
+        selected_files = self.get_selected_filenames()
+        if not selected_files:
+            messagebox.showwarning("Warning", "Please select a file first")
+            return None
+        if len(selected_files) > 1:
+            messagebox.showwarning("Warning", f"Please select only one file to {action_name.lower()}")
+            return None
+        return selected_files[0]
     
     def rename_selected_file(self):
         """重命名选中的文件线条"""
-        selection = self.file_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("Warning", "Please select a file first")
+        filename = self.get_single_selected_filename("Rename Line")
+        if not filename:
             return
-
-        index = selection[0]
-        filename = list(self.file_data.keys())[index]
 
         new_label = simpledialog.askstring(
             "Rename Line",
@@ -739,13 +800,10 @@ class MultiCurveChartApp:
 
     def change_file_color(self):
         """更改选中文件的颜色"""
-        selection = self.file_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("Warning", "Please select a file first")
+        filename = self.get_single_selected_filename("Change Color")
+        if not filename:
             return
 
-        index = selection[0]
-        filename = list(self.file_data.keys())[index]
         current_color = self.file_colors.get(filename, '#1f77b4')
 
         # 显示颜色选择器对话框
@@ -766,18 +824,21 @@ class MultiCurveChartApp:
     
     def remove_selected_file(self):
         """移除选中的文件"""
-        selection = self.file_listbox.curselection()
-        if not selection:
+        selected_files = self.get_selected_filenames()
+        if not selected_files:
             messagebox.showwarning("Warning", "Please select a file first")
             return
-        
-        index = selection[0]
-        filename = list(self.file_data.keys())[index]
-        
-        if messagebox.askyesno("Confirm", f"Remove file '{filename}'?"):
-            del self.file_data[filename]
-            del self.file_labels[filename]
-            del self.file_colors[filename]
+
+        if len(selected_files) == 1:
+            confirm_message = f"Remove file '{selected_files[0]}'?"
+        else:
+            confirm_message = f"Remove {len(selected_files)} selected files?"
+
+        if messagebox.askyesno("Confirm", confirm_message):
+            for filename in selected_files:
+                del self.file_data[filename]
+                del self.file_labels[filename]
+                del self.file_colors[filename]
             
             self.update_file_list()
             self.update_chart()
@@ -821,45 +882,279 @@ class MultiCurveChartApp:
                     return True
         
         return False
+
+    def _is_sequence_collection(self, value):
+        """判断值是否为列表/元组集合。"""
+        return isinstance(value, (list, tuple))
+
+    def _contains_nested_series(self, values):
+        """判断顶层列表中是否包含子序列。"""
+        if not self._is_sequence_collection(values):
+            return False
+        return any(self._is_sequence_collection(item) for item in values)
+
+    def _clean_xy_series(self, raw_x, raw_y, use_index_x):
+        """清洗单条序列，返回过滤后的 x/y 数据。"""
+        if not self._is_sequence_collection(raw_y):
+            return None
+
+        y_data = []
+        for y in raw_y:
+            try:
+                y_data.append(float(y))
+            except (ValueError, TypeError):
+                continue
+
+        if not y_data:
+            return None
+
+        if use_index_x:
+            x_data = list(range(len(y_data)))
+        else:
+            if not self._is_sequence_collection(raw_x):
+                return None
+
+            x_data = []
+            for x in raw_x:
+                try:
+                    x_data.append(float(x))
+                except (ValueError, TypeError):
+                    continue
+
+        min_length = min(len(x_data), len(y_data))
+        filtered_x, filtered_y = [], []
+        for i in range(min_length):
+            if x_data[i] <= 60000:
+                filtered_x.append(x_data[i])
+                filtered_y.append(y_data[i])
+
+        if not filtered_x:
+            return None
+
+        return filtered_x, filtered_y
+
+    def extract_series_from_file(self, filename, data, x_key, y_key):
+        """从单个文件中提取一条或多条有效序列。"""
+        if y_key not in data:
+            return []
+
+        raw_y = data[y_key]
+        if self._contains_nested_series(raw_y):
+            y_series_list = [
+                item for item in raw_y
+                if self._is_sequence_collection(item)
+            ]
+        else:
+            y_series_list = [raw_y]
+
+        if not y_series_list:
+            return []
+
+        if x_key == 'num':
+            x_series_list = [None] * len(y_series_list)
+            use_index_x = True
+        else:
+            if x_key not in data:
+                return []
+
+            raw_x = data[x_key]
+            use_index_x = False
+
+            if self._contains_nested_series(raw_x) and len(raw_x) == len(y_series_list):
+                x_series_list = list(raw_x)
+            else:
+                x_series_list = [raw_x] * len(y_series_list)
+
+        extracted = []
+        for idx, raw_y_series in enumerate(y_series_list):
+            raw_x_series = x_series_list[idx]
+            cleaned = self._clean_xy_series(raw_x_series, raw_y_series, use_index_x)
+            if not cleaned:
+                continue
+
+            x_data, y_data = cleaned
+            series_name = filename if len(y_series_list) == 1 else f"{filename}#{idx + 1}"
+            extracted.append((series_name, list(x_data), list(y_data)))
+
+        return extracted
     
+    def normalize_series(self, extracted):
+        """应用可选平滑并标准化提取的序列。"""
+        normalized = []
+        for series_name, x_data, y_data in extracted:
+            normalized.append((
+                series_name,
+                list(x_data),
+                list(self.apply_smoothing(y_data)) if self.smooth_enabled.get() else list(y_data)
+            ))
+        return normalized
+
     def process_file_data(self, filename, data, x_key, y_key):
         """处理单个文件的数据"""
         try:
-            # 获取Y轴数据并过滤无效值
-            raw_y = data[y_key]
-            y_data = []
-            for y in raw_y:
-                try:
-                    y_data.append(float(y))
-                except (ValueError, TypeError):
-                    continue
-            
-            # 生成X轴数据
-            if x_key == 'num':
-                x_data = list(range(len(y_data)))
-            else:
-                x_data = []
-                for x in data[x_key]:
-                    try:
-                        x_data.append(float(x))
-                    except (ValueError, TypeError):
-                        continue
-            
-            # 自动对齐数据长度并限制X值小于10000
-            min_length = min(len(x_data), len(y_data))
-            filtered_x, filtered_y = [], []
-            for i in range(min_length):
-                if x_data[i] < 10000:
-                    filtered_x.append(x_data[i])
-                    filtered_y.append(y_data[i])
-            
-            if not filtered_x:
+            normalized = self.normalize_series(self.extract_series_from_file(filename, data, x_key, y_key))
+            if not normalized:
                 return None
-            
-            return filtered_x, filtered_y
-        except:
+            if len(normalized) == 1:
+                _, x_data, y_data = normalized[0]
+                return x_data, y_data
+            stats = self.calculate_series_stats(normalized, include_range=True)
+            return (stats[0], stats[1]) if stats else None
+        except Exception:
             return None
-    
+
+    def calculate_series_stats(self, series, include_range=False):
+        """按索引对齐多条序列，计算 mean/std，可选 min/max。"""
+        if not series:
+            return None
+
+        min_length = min(len(y_data) for _, _, y_data in series)
+        if min_length <= 0:
+            return None
+
+        x_data = series[0][1][:min_length]
+        mean_y, std_y = [], []
+        min_y, max_y = ([] if include_range else None), ([] if include_range else None)
+
+        for i in range(min_length):
+            values = [y_data[i] for _, _, y_data in series]
+            mean_value = sum(values) / len(values)
+            mean_y.append(mean_value)
+            if include_range:
+                min_y.append(min(values))
+                max_y.append(max(values))
+
+            if len(values) <= 1:
+                std_y.append(0.0)
+            else:
+                variance = sum((value - mean_value) ** 2 for value in values) / len(values)
+                std_y.append(variance ** 0.5)
+
+        return (x_data, mean_y, std_y, min_y, max_y) if include_range else (x_data, mean_y, std_y)
+
+    def calculate_moving_stats(self, y_data, window_size):
+        """计算滑动平均和标准差。"""
+        if not y_data:
+            return [], []
+
+        window_size = max(1, min(window_size, len(y_data)))
+        mean_y, std_y = [], []
+
+        for i in range(len(y_data)):
+            start = max(0, i - window_size + 1)
+            window_values = y_data[start:i + 1]
+            mean_value = sum(window_values) / len(window_values)
+            mean_y.append(mean_value)
+
+            if len(window_values) <= 1:
+                std_y.append(0.0)
+            else:
+                variance = sum((value - mean_value) ** 2 for value in window_values) / len(window_values)
+                std_y.append(variance ** 0.5)
+
+        return mean_y, std_y
+
+    def plot_line(self, ax, x_data, y_data, color, label, linewidth, alpha=0.95):
+        ax.plot(
+            x_data,
+            y_data,
+            linestyle='-',
+            color=color,
+            linewidth=linewidth,
+            label=label,
+            marker='None',
+            alpha=alpha,
+            zorder=10 if linewidth > 1 else None
+        )
+
+    def finalize_chart(self, ax, x_key, y_key, title, legend_kwargs):
+        ax.set_title(title, fontsize=14, pad=15)
+        ax.legend(**legend_kwargs)
+        ax.set_xlabel(x_key if x_key != 'num' else 'Data Point Index', fontsize=12, labelpad=10)
+        ax.set_ylabel(y_key, fontsize=12, labelpad=10)
+        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def plot_file_mean_shadow(self, ax, filename, data, x_key, y_key):
+        """按文件绘制 Mean + Range Shadow。"""
+        print(f"Processing mean shadow for file: {filename}")
+        print(f"Available fields: {list(data.keys())}")
+
+        normalized_series = self.normalize_series(self.extract_series_from_file(filename, data, x_key, y_key))
+        if not normalized_series:
+            print(f"Skipping {filename}: no valid data for mean shadow")
+            return False
+
+        color = self.file_colors.get(filename, 'steelblue')
+        line_label = self.file_labels.get(filename, filename)
+
+        if len(normalized_series) > 1:
+            mean_std = self.calculate_series_stats(normalized_series)
+            if not mean_std:
+                print(f"Skipping {filename}: failed to calculate internal mean/std")
+                return False
+
+            x_data, mean_y, std_y = mean_std
+            lower_y = [mean - 0.5 * std for mean, std in zip(mean_y, std_y)]
+            upper_y = [mean + 0.5 * std for mean, std in zip(mean_y, std_y)]
+
+            ax.fill_between(
+                x_data,
+                lower_y,
+                upper_y,
+                color=color,
+                alpha=0.15,
+                edgecolor='none'
+            )
+            self.plot_line(ax, x_data, mean_y, color, line_label, 2.0)
+            print(f"Plotted mean shadow for {filename}: {len(normalized_series)} internal series")
+            return True
+
+        _, x_data, raw_y = normalized_series[0]
+        mean_window = self.get_mean_shadow_window()
+        mean_y, std_y = self.calculate_moving_stats(raw_y, window_size=mean_window)
+
+        lower_y = [mean - 0.5 * std for mean, std in zip(mean_y, std_y)]
+        upper_y = [mean + 0.5 * std for mean, std in zip(mean_y, std_y)]
+
+        ax.fill_between(
+            x_data,
+            lower_y,
+            upper_y,
+            color=color,
+            alpha=0.15,
+            edgecolor='none'
+        )
+        self.plot_line(ax, x_data, mean_y, color, line_label, 2.0)
+        print(f"Plotted single-series mean shadow for {filename}: {len(x_data)} data points")
+        return True
+
+    def plot_single_series(self, ax, filename, data, x_key, y_key):
+        """绘制单个文件的曲线，成功时返回 True。"""
+        print(f"Processing file: {filename}")
+        print(f"Available fields: {list(data.keys())}")
+
+        if y_key not in data:
+            print(f"Skipping {filename}: missing {y_key}")
+            return False
+
+        processed = self.process_file_data(filename, data, x_key, y_key)
+        if not processed or not all(len(d) > 0 for d in processed):
+            print(f"Skipping {filename}: no valid data")
+            return False
+
+        x_data, y_data = processed
+        print(f"Plotting {filename}: {len(x_data)} data points")
+
+        line_label = self.file_labels.get(filename, filename)
+        color = self.file_colors.get(filename, 'steelblue')
+
+        self.plot_line(ax, x_data, y_data, color, line_label, 1, alpha=0.8)
+        return True
+
     def update_chart(self):
         """更新图表 - 确保显示所有曲线"""
         if not self.validate_entries():
@@ -876,64 +1171,39 @@ class MultiCurveChartApp:
         # 调试信息
         print(f"Attempting to plot {len(self.file_data)} files...")
         print(f"X axis: {x_key}, Y axis: {y_key}")
+
+        if self.mean_shadow_enabled.get():
+            selected_files = self.get_selected_filenames()
+            mean_shadow_files = selected_files if selected_files else list(self.file_data.keys())
+
+            for filename, data in self.file_data.items():
+                if filename in mean_shadow_files:
+                    if self.plot_file_mean_shadow(ax, filename, data, x_key, y_key):
+                        lines_plotted += 1
+                else:
+                    if self.plot_single_series(ax, filename, data, x_key, y_key):
+                        lines_plotted += 1
+
+            if lines_plotted > 0:
+                chart_title = f"{'Selected ' if selected_files else ''}Per-File Mean + Range Shadow - {y_key}"
+                self.finalize_chart(ax, x_key, y_key, chart_title, {'loc': 'best', 'frameon': False})
+            else:
+                messagebox.showwarning("Warning", "No data to plot")
+            return
         
         # 为每个文件绘制线条
         for filename, data in self.file_data.items():
-            print(f"Processing file: {filename}")
-            print(f"Available fields: {list(data.keys())}")
-            
-            if y_key not in data:
-                print(f"Skipping {filename}: missing {y_key}")
-                continue
-                
-            processed = self.process_file_data(filename, data, x_key, y_key)
-            if not processed or not all(len(d) > 0 for d in processed):
-                print(f"Skipping {filename}: no valid data")
-                continue
-                
-            x_data, y_data = processed
-            print(f"Plotting {filename}: {len(x_data)} data points")
-            
-            # 应用平滑
-            if self.smooth_enabled.get():
-                y_data = self.apply_smoothing(y_data)
-            
-            # 获取线条标签和颜色
-            line_label = self.file_labels.get(filename, filename)
-            color = self.file_colors.get(filename, 'steelblue')
-            
-            # 绘制线条
-            ax.plot(
-                x_data, y_data,
-                linestyle='-',
-                color=color,
-                linewidth=1,
-                label=line_label,
-                marker='None',
-                markersize=4,
-                alpha=0.8
-            )
-            
-            lines_plotted += 1
+            if self.plot_single_series(ax, filename, data, x_key, y_key):
+                lines_plotted += 1
         
         print(f"Total lines plotted: {lines_plotted}")
         
         if lines_plotted > 0:
-            # 使用英文标题，去除空白字符
-            chart_title = f"Multi-File Data Comparison - {y_key}"
-            ax.set_title(chart_title, fontsize=14, pad=15)
-            ax.legend(loc='best', frameon=True, fancybox=True, shadow=True)
-            
-            # 使用英文标签
-            x_label = x_key if x_key != 'num' else 'Data Point Index'
-            ax.set_xlabel(x_label, fontsize=12, labelpad=10)
-            ax.set_ylabel(y_key, fontsize=12, labelpad=10)
-            ax.grid(True, linestyle='--', alpha=0.7)
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            
-            self.figure.tight_layout()
-            self.canvas.draw()
+            self.finalize_chart(
+                ax, x_key, y_key,
+                f"Multi-File Data Comparison - {y_key}",
+                {'loc': 'best', 'frameon': True, 'fancybox': True, 'shadow': True}
+            )
         else:
             messagebox.showwarning("Warning", "No data to plot")
 

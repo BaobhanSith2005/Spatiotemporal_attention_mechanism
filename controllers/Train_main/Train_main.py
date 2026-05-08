@@ -1,7 +1,21 @@
 import sys
 import os
 # 添加项目路径到系统路径
-sys.path.append('D:\\project_Spatiotemporal_attention_mechanism')
+_conda = r"D:\\Anaconda3\\envs\\webots"
+_extra = [
+    _conda,
+    rf"{_conda}\Library\mingw-w64\bin",
+    rf"{_conda}\Library\usr\bin",
+    rf"{_conda}\Library\bin",
+    rf"{_conda}\Scripts",
+    rf"{_conda}\bin",
+]
+os.environ["PATH"] = ";".join(_extra) + ";" + os.environ.get("PATH", "")
+
+_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_CUR_DIR, os.pardir, os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 from python_scripts.DQN import DQN_episoid
 from python_scripts.PPO import PPO_episoid_1
 from python_scripts.SAC import SAC_episoid

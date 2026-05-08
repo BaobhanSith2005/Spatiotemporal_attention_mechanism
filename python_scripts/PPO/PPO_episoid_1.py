@@ -14,7 +14,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 import numpy as np
 from python_scripts.PPO.PPO_PPOnet_2 import PPO2
-from python_scripts.PPO.PPO_PPOnet_attention import PPO, ActorCritic
+from python_scripts.PPO.PPO_PPOnet_attention2_1 import PPO, ActorCritic
 from python_scripts.PPO.Replay_memory import ReplayMemory
 from python_scripts.PPO.Replay_memory_2 import ReplayMemory_2
 from python_scripts.PPO.PPO_episoid_2_1 import PPO_tai_episoid
