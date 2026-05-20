@@ -1,15 +1,14 @@
 from controller import Supervisor, Node
 import os
-_conda = r"D:\\Anaconda3\\envs\\webots"
-_extra = [
-    _conda,
-    rf"{_conda}\Library\mingw-w64\bin",
-    rf"{_conda}\Library\usr\bin",
-    rf"{_conda}\Library\bin",
-    rf"{_conda}\Scripts",
-    rf"{_conda}\bin",
-]
-os.environ["PATH"] = ";".join(_extra) + ";" + os.environ.get("PATH", "")
+CONDA_PREFIX = r"E:\conda_envs\webots37"
+os.environ["PATH"] = (
+    rf"{CONDA_PREFIX}\Library\bin;"
+    rf"{CONDA_PREFIX}\DLLs;"
+    rf"{CONDA_PREFIX}\Scripts;"
+    rf"{CONDA_PREFIX};"
+    + os.environ.get("PATH", "")
+)
+
 
 import numpy as np
 import operator
@@ -82,14 +81,15 @@ class SupervisorRobot:
         self.robot.step(self.timestep)
         isremove = True
         while True:
-            with open('D:\\compare_project_Spatiotemporal_attention_mechanism\\project_Spatiotemporal_attention_mechanism\\python_scripts\\resetFlag.txt', 'r') as file:
+            with open('E:\\github_clone\\github_clone02\\Spatiotemporal_attention_mechanism\\python_scripts\\resetFlag.txt', 'r') as file:
                 flag = file.read()
                 if flag == '0':
-                    with open('D:\\compare_project_Spatiotemporal_attention_mechanism\\project_Spatiotemporal_attention_mechanism\\python_scripts\\resetFlag.txt', 'r+') as file:
+                    with open('E:\\github_clone\\github_clone02\\Spatiotemporal_attention_mechanism\\python_scripts\\resetFlag.txt', 'r+') as file:
                         file.write('1')
                     self.robot.simulationResetPhysics()
                     self.reset()
             self.robot.step(self.timestep)
+
     
 supervisorRobot = SupervisorRobot()
 supervisorRobot.resetsimulation()

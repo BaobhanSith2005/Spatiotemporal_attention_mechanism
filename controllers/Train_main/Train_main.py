@@ -1,16 +1,15 @@
 import sys
 import os
 # 添加项目路径到系统路径
-_conda = r"D:\\Anaconda3\\envs\\webots"
-_extra = [
-    _conda,
-    rf"{_conda}\Library\mingw-w64\bin",
-    rf"{_conda}\Library\usr\bin",
-    rf"{_conda}\Library\bin",
-    rf"{_conda}\Scripts",
-    rf"{_conda}\bin",
-]
-os.environ["PATH"] = ";".join(_extra) + ";" + os.environ.get("PATH", "")
+CONDA_PREFIX = r"E:\conda_envs\webots37"
+os.environ["PATH"] = (
+    rf"{CONDA_PREFIX}\Library\bin;"
+    rf"{CONDA_PREFIX}\DLLs;"
+    rf"{CONDA_PREFIX}\Scripts;"
+    rf"{CONDA_PREFIX};"
+    + os.environ.get("PATH", "")
+)
+
 
 _CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_CUR_DIR, os.pardir, os.pardir))

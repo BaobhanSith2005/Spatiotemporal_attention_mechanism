@@ -16,37 +16,37 @@ MEMORY_CAPACITY = 100000
 
 # 路径配置
 path_list = {
-    'resetFlag': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/resetFlag.txt',
-    'resetFlag1': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/resetFlag1.txt',
-    'memory_graph': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/GNN/memory/memory_graph.pkl',
-    'photo_path_real': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts',
-    'photo_path': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/photo',
+    'resetFlag': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/resetFlag.txt',
+    'resetFlag1': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/resetFlag1.txt',
+    'memory_graph': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/GNN/memory/memory_graph.pkl',
+    'photo_path_real': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts',
+    'photo_path': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/photo',
      
     #DQN 
-    'model_path_catch_DQN': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/DQN/checkpoint/catch',
-    'model_path_tai_DQN': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/DQN/checkpoint/tai',
-    'shu_ju_path_DQN':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/DQN/shu_ju.txt',
-    'gps_path_DQN':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/DQN/gps.txt',
-    'catch_log_path_DQN':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/DQN/log/catch_log/',
-    'tai_log_path_DQN':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/DQN/log/tai_log/',
+    'model_path_catch_DQN': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/DQN/checkpoint/catch',
+    'model_path_tai_DQN': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/DQN/checkpoint/tai',
+    'shu_ju_path_DQN':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/DQN/shu_ju.txt',
+    'gps_path_DQN':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/DQN/gps.txt',
+    'catch_log_path_DQN':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/DQN/log/catch_log/',
+    'tai_log_path_DQN':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/DQN/log/tai_log/',
 
     #PPO
-    'model_path_catch_PPO': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/PPO/checkpoint/catch',
-    'model_path_tai_PPO': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/PPO/checkpoint/tai',
-    'shu_ju_path_PPO':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/PPO/shu_ju.txt',
-    'gps_path_PPO':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/PPO/gps.txt',
-    'catch_log_path_PPO':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/PPO/log/catch_log/',
-    'tai_log_path_PPO':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/PPO/log/tai_log/',
+    'model_path_catch_PPO': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/PPO/checkpoint/catch',
+    'model_path_tai_PPO': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/PPO/checkpoint/tai',
+    'shu_ju_path_PPO':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/PPO/shu_ju.txt',
+    'gps_path_PPO':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/PPO/gps.txt',
+    'catch_log_path_PPO':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/PPO/log/catch_log/',
+    'tai_log_path_PPO':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/PPO/log/tai_log/',
 
     #SAC
-    'model_path_catch_SAC': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/SAC/checkpoint/catch',
-    'model_path_tai_SAC': 'D:/project_Spatiotemporal_attention_mechanism/python_scripts/SAC/checkpoint/tai',
-    'shu_ju_path_SAC':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/SAC/shu_ju.txt',
-    'gps_path_SAC':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/SAC/gps.txt',
-    'catch_log_path_SAC':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/SAC/log/catch_log/',
-    'tai_log_path_SAC':'D:/project_Spatiotemporal_attention_mechanism/python_scripts/SAC/log/tai_log/'
-
+    'model_path_catch_SAC': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/SAC/checkpoint/catch',
+    'model_path_tai_SAC': 'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/SAC/checkpoint/tai',
+    'shu_ju_path_SAC':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/SAC/shu_ju.txt',
+    'gps_path_SAC':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/SAC/gps.txt',
+    'catch_log_path_SAC':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/SAC/log/catch_log/',
+    'tai_log_path_SAC':'E:/github_clone/github_clone02/Spatiotemporal_attention_mechanism/python_scripts/SAC/log/tai_log/'
 }
+
 
 gps_goal = [0.2, 0.175]  # 目标位置坐标1
 gps_goal1 = [0.27, 0.225]  # 目标位置坐标2
